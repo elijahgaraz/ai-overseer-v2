@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: ai-overseer
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -k uvicorn.workers.UvicornWorker -w 2 -b 0.0.0.0:$PORT app.main:app
+    autoDeploy: true
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ADVISOR_TOKEN
+        generateValue: true
+      - key: OPENAI_MODEL
+        value: gpt-4.1-mini
+      - key: TE_API_KEY
+        value: guest:guest
+      - key: ECB_RSS
+        value: https://www.ecb.europa.eu/press/rss/press.html
+      - key: FED_RSS
+        value: https://www.federalreserve.gov/feeds/press_all.xml

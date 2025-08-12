@@ -18,7 +18,7 @@ TIMEZONE = os.getenv("OVERSEER_TZ") or os.getenv("OVERSER_TZ") or "Europe/London
 client = OpenAI(timeout=8.0)  # reads OPENAI_API_KEY from env
 app = FastAPI(title="AI Overseer (Realtime FX)", version="2.2.0")
 
-# ---------- Models ----------
+# ---------- Models ---------
 class AdvisorSource(BaseModel):
     title: str
     url: str
@@ -156,7 +156,6 @@ def model_decision_json(user_input: str) -> Dict[str, Any]:
                 {"role": "user", "content": user_input},
             ],
             response_format={"type": "json_schema", "json_schema": JSON_SCHEMA},
-            temperature=0.2,
         )
         return json.loads(ch.choices[0].message.content)
     except TypeError:

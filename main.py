@@ -53,7 +53,8 @@ JSON_SCHEMA = {
                         "url": {"type": "string"},
                         "published": {"type": "string"}
                     },
-                    "required": ["title", "url"]
+                    "required": ["title", "url"],
+                    "additionalProperties": False   # <-- add this line
                 }
             }
         },
@@ -62,6 +63,7 @@ JSON_SCHEMA = {
     },
     "strict": True
 }
+
 
 SYSTEM = (
     "You are the AI Overseer for an FX day-trading bot (pairs may include GBPUSD, EURUSD). "

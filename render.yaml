@@ -4,15 +4,20 @@ services:
     env: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn -k uvicorn.workers.UvicornWorker -w 2 -b 0.0.0.0:$PORT app.main:app
+    # main.py at repo root, FastAPI instance is `app`
+    startCommand: gunicorn -k uvicorn.workers.UvicornWorker -w 2 -b 0.0.0.0:$PORT main:app
     autoDeploy: true
+    healthCheckPath: /health
     envVars:
       - key: OPENAI_API_KEY
-        sync: false
+        sync: false          # you'll enter this on first apply
       - key: ADVISOR_TOKEN
-        generateValue: true
-      - key: OPENAI_MODEL
-        value: gpt-4.1-mini
+        generateValue: true  # Render will generate a secret; copy it into your cBot's "Advisor Auth Token"
+      - key: ADVISOR_MODEL
+        value: gpt-4o-mini   # matches the code's env var name
+      - key: OPENAI_TIMEOUT_MS
+        value: "800"
+      # Optional extras (kept from your file; safe to remove if unused)
       - key: TE_API_KEY
         value: guest:guest
       - key: ECB_RSS

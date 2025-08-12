@@ -25,20 +25,21 @@ class SimpleAdviceOut(BaseModel):
     as_of: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 JSON_SCHEMA = {
-    "name": "EntryAdvice",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "direction": {"type": "string", "enum": ["BUY", "SELL", "HOLD"]},
-            "confidence_pct": {"type": "number", "minimum": 0, "maximum": 100},
-            "reason": {"type": "string"},
-            "as_of": {"type": "string"}
-        },
-        "required": ["direction", "confidence_pct", "as_of"],
-        "additionalProperties": False
+  "name": "EntryAdvice",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "direction": {"type":"string","enum":["BUY","SELL","HOLD"]},
+      "confidence_pct": {"type":"number","minimum":0,"maximum":100},
+      "reason": {"type":"string"},
+      "as_of": {"type":"string"}
     },
-    "strict": True
+    "required": ["direction","confidence_pct","reason","as_of"],  # <— add "reason"
+    "additionalProperties": False
+  },
+  "strict": True
 }
+
 
 SYSTEM = (
     "You are the AI Overseer for an FX bot. You receive: "

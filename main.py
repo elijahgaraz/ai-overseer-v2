@@ -8,7 +8,7 @@ import httpx, feedparser
 from openai import OpenAI
 
 # ---------- Config ----------
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")  # e.g., gpt-5, gpt-5-mini, gpt-4o-mini
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")  # e.g., gpt-5, gpt-5-mini, gpt-4o-mini
 ADVISOR_TOKEN = os.getenv("ADVISOR_TOKEN", "")
 TE_API_KEY = os.getenv("TE_API_KEY", "guest:guest")
 ECB_RSS = os.getenv("ECB_RSS", "https://www.ecb.europa.eu/press/rss/press.html")

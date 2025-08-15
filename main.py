@@ -61,6 +61,7 @@ SYSTEM = (
     "If the calendar shows upcoming high-impact events within 72h, mention that explicitly. "
     "If RSS feeds have no posts within the last 7 days, state 'no recent official posts' rather than implying staleness. "
     "When high-impact events are more than 3 hours away and micro signals align, avoid excessive caution; select BUY/SELL with justified confidence. "
+    "If high-impact events are more than 12 hours away, do not prefer HOLD solely due to their presence. Prefer HOLD only if events are within 12 hours, spreads are elevated versus typical levels, or signals conflict. "
     "Return JSON ONLY conforming to the provided schema."
 )
 
@@ -220,7 +221,6 @@ def fetch_marketaux_sentiment(symbol: str, limit: int = 6, max_age_hours: int = 
     """
     if not MARKETAUX_KEY:
         return []
-    # Broad query for EUR/USD macro
     q = "EURUSD OR \"EUR/USD\" OR ECB OR \"Euro area\" OR Eurozone OR FOMC OR \"Federal Reserve\""
     params = {
         "api_token": MARKETAUX_KEY,
@@ -244,10 +244,8 @@ def fetch_marketaux_sentiment(symbol: str, limit: int = 6, max_age_hours: int = 
                 pub_dt = _safe_parse_dt(published)
                 if not pub_dt or pub_dt < cutoff:
                     continue
-                # sentiment score may appear under various keys; handle gracefully
                 sentiment = None
                 if isinstance(art.get("entities"), list):
-                    # try to find an overall sentiment if provided
                     for ent in art["entities"]:
                         if isinstance(ent, dict) and "sentiment_score" in ent:
                             sentiment = ent.get("sentiment_score")
@@ -262,6 +260,46 @@ def fetch_marketaux_sentiment(symbol: str, limit: int = 6, max_age_hours: int = 
     except Exception:
         return []
 
+# ---------- EURUSD relevance helpers ----------
+KEYWORDS_EURUSD = (
+    "ecb", "deposit facility", "refi", "rate decision",
+    "fomc", "fed",
+    "cpi", "pce", "core pce", "nfp", "nonfarm", "payroll", "unemployment",
+    "gdp", "pmi", "ism", "ppi", "retail sales"
+)
+
+def _hours_until(dt_iso: str) -> float:
+    try:
+        dt = _safe_parse_dt(dt_iso)
+        if not dt:
+            return float("inf")
+        now = datetime.now(timezone.utc)
+        return max(0.0, (dt - now).total_seconds() / 3600.0)
+    except Exception:
+        return float("inf")
+
+def next_relevant_event_hours(cal_items: List[Dict[str, Any]]) -> float:
+    """
+    Return hours until the nearest likely EURUSD-relevant event by simple keyword match.
+    """
+    best = float("inf")
+    for it in cal_items:
+        title = (it.get("title") or "").lower()
+        when = it.get("published") or it.get("date") or it.get("when")
+        if any(k in title for k in KEYWORDS_EURUSD):
+            h = _hours_until(when)
+            if h < best:
+                best = h
+    return best
+
+def filter_calendar_for_eurusd(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for it in items:
+        t = (it.get("title") or "").lower()
+        if any(k in t for k in KEYWORDS_EURUSD):
+            out.append(it)
+    return out
+
 # ---------- Context builder ----------
 def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     # Determine relevant countries
@@ -272,7 +310,11 @@ def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     ecb_items = fetch_rss(ECB_RSS, 5, max_age_days=7)
     fed_items = fetch_rss(FED_RSS, 5, max_age_days=7)
     eurostat_items = fetch_eurostat_recent(5, max_age_days=7)
-    cal_items = fetch_te_calendar(countries)
+
+    cal_items_all = fetch_te_calendar(countries)
+    cal_items = filter_calendar_for_eurusd(cal_items_all)
+    hrs_next = next_relevant_event_hours(cal_items)
+    soon_threshold = 12.0  # treat <12h as "imminent" risk
 
     # Enrichers (optional)
     headlines = fetch_bing_headlines(sym or "EURUSD", count=8, freshness_hours=24)
@@ -296,10 +338,14 @@ def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     if MARKETAUX_KEY: enabled_bits.append("Marketaux")
     enabled_str = ", ".join(enabled_bits) if enabled_bits else "none"
 
+    next_evt_str = "∞" if hrs_next == float("inf") else f"{round(hrs_next,1)}"
+    filtered_note = f"(filtered {len(cal_items)} of {len(cal_items_all)} events for EURUSD relevance)"
+
     header = (
         f"LATEST CONTEXT as of {now_iso} (tz=UTC; local_tz={TIMEZONE}):\n"
         "• RSS recency: ≤7 days; Economic calendar window: today + next 3 days; importance=high\n"
         f"• Countries for calendar: {', '.join(countries)}\n"
+        f"• Next relevant high-impact event in ≈ {next_evt_str}h (imminent<{soon_threshold}h) {filtered_note}\n"
         f"• Optional enrichers enabled: {enabled_str}\n"
     )
 
@@ -339,7 +385,7 @@ def model_decision_json(user_input: str) -> Dict[str, Any]:
             return json.loads(ch.choices[0].message.content)
         except Exception:
             # Final fallback: instruct JSON-only
-            ch = client.chat.completions.create(
+            ch = client.chat_completions.create(  # backward-compat if needed
                 model=MODEL,
                 messages=[
                     {"role": "system", "content": SYSTEM + "\nReturn JSON ONLY with keys: direction, confidence_pct, reason, as_of."},

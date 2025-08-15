@@ -1,10 +1,11 @@
 import os, json, traceback
 from typing import Optional, Dict, Any, List
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 import httpx, feedparser
 from openai import OpenAI
+from email.utils import parsedate_to_datetime
 
 # ---------- Config ----------
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")  # gpt-5, gpt-5-mini, or gpt-4o-mini are fine
@@ -34,12 +35,11 @@ JSON_SCHEMA = {
       "reason": {"type":"string"},
       "as_of": {"type":"string"}
     },
-    "required": ["direction","confidence_pct","reason","as_of"],  # <— add "reason"
+    "required": ["direction","confidence_pct","reason","as_of"],
     "additionalProperties": False
   },
   "strict": True
 }
-
 
 SYSTEM = (
     "You are the AI Overseer for an FX bot. You receive: "
@@ -50,6 +50,8 @@ SYSTEM = (
     "- confidence_pct: 0–100 (as a percentage, not probability)\n"
     "Prefer HOLD near market-moving news (e.g., CPI/NFP/rate decisions) or elevated spreads. "
     "If signals are mixed or context is stale, LOWER confidence. "
+    "If the calendar shows upcoming high-impact events within 72h, mention that explicitly. "
+    "If RSS feeds have no posts within the last 7 days, state 'no recent official posts' rather than implying staleness. "
     "Return JSON ONLY conforming to the provided schema."
 )
 
@@ -63,11 +65,35 @@ def _auth_or_403(header_value: Optional[str]):
 def _iso(dt: datetime) -> str:
     return dt.isoformat()
 
-def fetch_te_calendar() -> List[Dict[str, Any]]:
+def _safe_parse_dt(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    # try RFC-2822 first (common in RSS), then ISO-8601
+    try:
+        dt = parsedate_to_datetime(s)
+        # ensure timezone-aware in UTC
+        if dt and dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc) if dt else None
+    except Exception:
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+def fetch_te_calendar(countries: List[str]) -> List[Dict[str, Any]]:
+    """
+    High-impact economic calendar for today + next 3 days.
+    """
     d1 = date.today().isoformat()
+    d2 = (date.today() + timedelta(days=3)).isoformat()
+    country_param = ",".join(countries)
     url = (
         "https://api.tradingeconomics.com/calendar?"
-        f"country=United%20States,Euro%20Area&importance=3&d1={d1}&d2={d1}&format=json&c={TE_API_KEY}"
+        f"country={country_param}&importance=3&d1={d1}&d2={d2}&format=json&c={TE_API_KEY}"
     )
     try:
         with httpx.Client(timeout=5.5) as http:
@@ -76,7 +102,7 @@ def fetch_te_calendar() -> List[Dict[str, Any]]:
                 return []
             data = r.json()
             out = []
-            for it in data[:30]:
+            for it in data[:50]:
                 title = it.get("Event") or it.get("Title") or "Event"
                 when = it.get("DateTime") or it.get("DateUtc") or it.get("Date")
                 country = it.get("Country") or ""
@@ -88,35 +114,78 @@ def fetch_te_calendar() -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-def fetch_rss(url: str, limit: int = 5) -> List[Dict[str, Any]]:
-    out = []
+def fetch_rss(url: str, limit: int = 5, max_age_days: int = 7) -> List[Dict[str, Any]]:
+    """
+    RSS fetch with recency filter (≤ max_age_days). Skips unknown/naive timestamps.
+    """
+    out: List[Dict[str, Any]] = []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
     try:
         feed = feedparser.parse(url)
         for e in (feed.entries or [])[:limit]:
+            raw_pub = getattr(e, "published", None) or getattr(e, "updated", None)
+            pub_dt = _safe_parse_dt(raw_pub)
+            if not pub_dt or pub_dt < cutoff:
+                continue
             out.append({
                 "title": getattr(e, "title", "item"),
                 "url": getattr(e, "link", url),
-                "published": getattr(e, "published", None) or getattr(e, "updated", None)
+                "published": pub_dt.isoformat()
             })
     except Exception:
         pass
     return out
 
+def _countries_for_symbol(sym: str) -> List[str]:
+    """
+    Choose relevant countries for TE calendar based on the pair symbol.
+    Falls back to a broad set if symbol is missing.
+    """
+    s = (sym or "").upper()
+    # Default coverage
+    countries = ["United Kingdom", "United States", "Euro Area"]
+    if "GBP" in s and "USD" in s:
+        return ["United Kingdom", "United States"]
+    if "EUR" in s and "USD" in s:
+        return ["Euro Area", "United States"]
+    if "GBP" in s and "EUR" in s:
+        return ["United Kingdom", "Euro Area"]
+    # Add others as needed
+    return countries
+
 def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    ctx = {
-        "feeds": {
-            "ecb": fetch_rss(ECB_RSS, 5),
-            "fed": fetch_rss(FED_RSS, 5),
-            "calendar": fetch_te_calendar(),
-        },
-        "as_of": _iso(datetime.now(timezone.utc))
-    }
-    bullets: List[str] = []
-    for label in ("ecb", "fed", "calendar"):
-        for item in ctx["feeds"][label]:
-            bullets.append(f"- {label.upper()}: {item['title']} [{item.get('published')}] -> {item['url']}")
-    ctx_text = "LATEST CONTEXT:\n" + "\n".join(bullets[:20])
-    return {"context_text": ctx_text, "as_of": ctx["as_of"]}
+    # Determine relevant countries
+    sym = (snapshot.get("symbol") or snapshot.get("Symbol") or "").upper()
+    countries = _countries_for_symbol(sym)
+
+    # Fresh RSS (≤7 days) and upcoming calendar (today + 3 days)
+    ecb_items = fetch_rss(ECB_RSS, 5, max_age_days=7)
+    fed_items = fetch_rss(FED_RSS, 5, max_age_days=7)
+    cal_items = fetch_te_calendar(countries)
+
+    now_utc = datetime.now(timezone.utc)
+    now_iso = _iso(now_utc)
+
+    def bullets(label: str, items: List[Dict[str, Any]]) -> List[str]:
+        if not items:
+            if label in ("ecb", "fed"):
+                return [f"- {label.upper()}: No recent official posts (≤7d)."]
+            else:
+                return [f"- {label.upper()}: No high-impact items in the window."]
+        return [f"- {label.upper()}: {it['title']} [{it.get('published')}] -> {it['url']}" for it in items]
+
+    header = (
+        f"LATEST CONTEXT as of {now_iso} (tz=UTC; local_tz={TIMEZONE}):\n"
+        "• RSS recency: ≤7 days; Economic calendar window: today + next 3 days; importance=high\n"
+        f"• Countries for calendar: {', '.join(countries)}\n"
+    )
+    lines = []
+    lines += bullets("ecb", ecb_items)
+    lines += bullets("fed", fed_items)
+    lines += bullets("calendar", cal_items)
+
+    ctx_text = header + "\n".join(lines[:30])
+    return {"context_text": ctx_text, "as_of": now_iso}
 
 # --- Model call with robust fallbacks (no temperature) ---
 def model_decision_json(user_input: str) -> Dict[str, Any]:
@@ -124,7 +193,7 @@ def model_decision_json(user_input: str) -> Dict[str, Any]:
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": user_input},
     ]
-    # Try JSON Schema first (if supported by your SDK/model)
+    # Try JSON Schema first
     try:
         ch = client.chat.completions.create(
             model=MODEL,

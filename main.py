@@ -13,6 +13,14 @@ ADVISOR_TOKEN = os.getenv("ADVISOR_TOKEN", "")
 TE_API_KEY = os.getenv("TE_API_KEY", "guest:guest")
 ECB_RSS = os.getenv("ECB_RSS", "https://www.ecb.europa.eu/press/rss/press.html")
 FED_RSS = os.getenv("FED_RSS", "https://www.federalreserve.gov/feeds/press_all.xml")
+EUROSTAT_RSS = os.getenv("EUROSTAT_RSS", "https://ec.europa.eu/eurostat/news/rss")
+
+# Optional real-time headline/sentiment enrichers (auto-skip if keys missing)
+BING_NEWS_KEY = os.getenv("BING_NEWS_KEY", "")
+BING_NEWS_ENDPOINT = os.getenv("BING_NEWS_ENDPOINT", "https://api.bing.microsoft.com/v7.0/news/search")
+MARKETAUX_KEY = os.getenv("MARKETAUX_KEY", "")  # https://www.marketaux.com/
+MARKETAUX_ENDPOINT = os.getenv("MARKETAUX_ENDPOINT", "https://api.marketaux.com/v1/news/all")
+
 TIMEZONE = os.getenv("OVERSEER_TZ") or os.getenv("OVERSER_TZ") or "Europe/London"
 
 client = OpenAI(timeout=8.0)  # reads OPENAI_API_KEY
@@ -44,7 +52,7 @@ JSON_SCHEMA = {
 SYSTEM = (
     "You are the AI Overseer for an FX bot. You receive: "
     "(1) a 'snapshot' with current market/indicator values and "
-    "(2) a 'context' summarizing reputable sources (ECB/Fed RSS + TradingEconomics calendar). "
+    "(2) a 'context' summarizing reputable sources (ECB/Fed/Eurostat RSS + TradingEconomics calendar + optional headlines/sentiment). "
     "Using ONLY this information, output direction and confidence percentage: "
     "- direction ∈ {BUY, SELL, HOLD}\n"
     "- confidence_pct: 0–100 (as a percentage, not probability)\n"
@@ -52,6 +60,7 @@ SYSTEM = (
     "If signals are mixed or context is stale, LOWER confidence. "
     "If the calendar shows upcoming high-impact events within 72h, mention that explicitly. "
     "If RSS feeds have no posts within the last 7 days, state 'no recent official posts' rather than implying staleness. "
+    "When high-impact events are more than 3 hours away and micro signals align, avoid excessive caution; select BUY/SELL with justified confidence. "
     "Return JSON ONLY conforming to the provided schema."
 )
 
@@ -71,7 +80,6 @@ def _safe_parse_dt(s: Optional[str]) -> Optional[datetime]:
     # try RFC-2822 first (common in RSS), then ISO-8601
     try:
         dt = parsedate_to_datetime(s)
-        # ensure timezone-aware in UTC
         if dt and dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc) if dt else None
@@ -139,52 +147,171 @@ def fetch_rss(url: str, limit: int = 5, max_age_days: int = 7) -> List[Dict[str,
 def _countries_for_symbol(sym: str) -> List[str]:
     """
     Choose relevant countries for TE calendar based on the pair symbol.
-    Falls back to a broad set if symbol is missing.
+    Defaults for EURUSD.
     """
     s = (sym or "").upper()
-    # Default coverage
-    countries = ["United Kingdom", "United States", "Euro Area"]
-    if "GBP" in s and "USD" in s:
-        return ["United Kingdom", "United States"]
     if "EUR" in s and "USD" in s:
         return ["Euro Area", "United States"]
-    if "GBP" in s and "EUR" in s:
-        return ["United Kingdom", "Euro Area"]
-    # Add others as needed
-    return countries
+    # sensible default
+    return ["Euro Area", "United States"]
 
+# ---------- Enrichers ----------
+def fetch_eurostat_recent(limit: int = 5, max_age_days: int = 7) -> List[Dict[str, Any]]:
+    return fetch_rss(EUROSTAT_RSS, limit=limit, max_age_days=max_age_days)
+
+def fetch_bing_headlines(symbol: str, count: int = 8, freshness_hours: int = 24) -> List[Dict[str, Any]]:
+    """
+    Bing News Search (optional). Requires BING_NEWS_KEY.
+    Pulls last ~24h headlines for EURUSD/ECB/Fed, sorted by recency.
+    """
+    if not BING_NEWS_KEY:
+        return []
+    queries = [
+        "EURUSD OR \"EUR/USD\"",
+        "ECB OR \"European Central Bank\"",
+        "\"Federal Reserve\" OR Fed",
+        "Euro area inflation OR Eurozone CPI",
+        "US CPI OR Nonfarm payrolls OR FOMC",
+    ]
+    headers = {"Ocp-Apim-Subscription-Key": BING_NEWS_KEY}
+    freshness = "Day" if freshness_hours <= 24 else "Week"
+    results: List[Dict[str, Any]] = []
+    try:
+        with httpx.Client(timeout=6.5, headers=headers) as http:
+            for q in queries:
+                params = {
+                    "q": q,
+                    "count": max(2, count // len(queries)),
+                    "freshness": freshness,
+                    "sortBy": "Date",
+                    "safeSearch": "Off",
+                    "textDecorations": "false",
+                }
+                r = http.get(BING_NEWS_ENDPOINT, params=params)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                for art in (data.get("value") or []):
+                    title = art.get("name") or "headline"
+                    url = art.get("url") or ""
+                    published = art.get("datePublished") or ""
+                    pub_dt = _safe_parse_dt(published)
+                    if not pub_dt:
+                        continue
+                    results.append({
+                        "title": title,
+                        "url": url,
+                        "published": pub_dt.isoformat()
+                    })
+        # De-dup by title/url and keep most recent
+        dedup = {}
+        for it in sorted(results, key=lambda x: x["published"], reverse=True):
+            key = (it["title"], it["url"])
+            if key not in dedup:
+                dedup[key] = it
+        return list(dedup.values())[:count]
+    except Exception:
+        return []
+
+def fetch_marketaux_sentiment(symbol: str, limit: int = 6, max_age_hours: int = 48) -> List[Dict[str, Any]]:
+    """
+    Marketaux (optional). Requires MARKETAUX_KEY.
+    We query broad FX terms; provider may not tag FX perfectly, so treat as 'bonus' context.
+    """
+    if not MARKETAUX_KEY:
+        return []
+    # Broad query for EUR/USD macro
+    q = "EURUSD OR \"EUR/USD\" OR ECB OR \"Euro area\" OR Eurozone OR FOMC OR \"Federal Reserve\""
+    params = {
+        "api_token": MARKETAUX_KEY,
+        "search": q,
+        "language": "en",
+        "sort": "published_at:desc",
+        "limit": str(limit),
+    }
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    try:
+        with httpx.Client(timeout=6.5) as http:
+            r = http.get(MARKETAUX_ENDPOINT, params=params)
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            out: List[Dict[str, Any]] = []
+            for art in (data.get("data") or [])[:limit]:
+                title = art.get("title") or "news"
+                url = art.get("url") or ""
+                published = art.get("published_at")
+                pub_dt = _safe_parse_dt(published)
+                if not pub_dt or pub_dt < cutoff:
+                    continue
+                # sentiment score may appear under various keys; handle gracefully
+                sentiment = None
+                if isinstance(art.get("entities"), list):
+                    # try to find an overall sentiment if provided
+                    for ent in art["entities"]:
+                        if isinstance(ent, dict) and "sentiment_score" in ent:
+                            sentiment = ent.get("sentiment_score")
+                            break
+                if sentiment is None:
+                    sentiment = art.get("sentiment") or art.get("overall_sentiment_score")
+                t = f"{title}"
+                if sentiment is not None:
+                    t += f" (sentiment={sentiment})"
+                out.append({"title": t, "url": url, "published": pub_dt.isoformat()})
+            return out
+    except Exception:
+        return []
+
+# ---------- Context builder ----------
 def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     # Determine relevant countries
     sym = (snapshot.get("symbol") or snapshot.get("Symbol") or "").upper()
     countries = _countries_for_symbol(sym)
 
-    # Fresh RSS (≤7 days) and upcoming calendar (today + 3 days)
+    # Official & baseline
     ecb_items = fetch_rss(ECB_RSS, 5, max_age_days=7)
     fed_items = fetch_rss(FED_RSS, 5, max_age_days=7)
+    eurostat_items = fetch_eurostat_recent(5, max_age_days=7)
     cal_items = fetch_te_calendar(countries)
+
+    # Enrichers (optional)
+    headlines = fetch_bing_headlines(sym or "EURUSD", count=8, freshness_hours=24)
+    marketaux_items = fetch_marketaux_sentiment(sym or "EURUSD", limit=6, max_age_hours=48)
 
     now_utc = datetime.now(timezone.utc)
     now_iso = _iso(now_utc)
 
     def bullets(label: str, items: List[Dict[str, Any]]) -> List[str]:
         if not items:
-            if label in ("ecb", "fed"):
+            if label in ("ecb", "fed", "eurostat"):
                 return [f"- {label.upper()}: No recent official posts (≤7d)."]
+            elif label in ("headlines", "marketaux"):
+                return [f"- {label.upper()}: No recent items (provider disabled or no results)."]
             else:
                 return [f"- {label.upper()}: No high-impact items in the window."]
         return [f"- {label.upper()}: {it['title']} [{it.get('published')}] -> {it['url']}" for it in items]
+
+    enabled_bits = []
+    if BING_NEWS_KEY: enabled_bits.append("BingNews")
+    if MARKETAUX_KEY: enabled_bits.append("Marketaux")
+    enabled_str = ", ".join(enabled_bits) if enabled_bits else "none"
 
     header = (
         f"LATEST CONTEXT as of {now_iso} (tz=UTC; local_tz={TIMEZONE}):\n"
         "• RSS recency: ≤7 days; Economic calendar window: today + next 3 days; importance=high\n"
         f"• Countries for calendar: {', '.join(countries)}\n"
+        f"• Optional enrichers enabled: {enabled_str}\n"
     )
-    lines = []
+
+    lines: List[str] = []
     lines += bullets("ecb", ecb_items)
     lines += bullets("fed", fed_items)
+    lines += bullets("eurostat", eurostat_items)
     lines += bullets("calendar", cal_items)
+    lines += bullets("headlines", headlines)
+    lines += bullets("marketaux", marketaux_items)
 
-    ctx_text = header + "\n".join(lines[:30])
+    ctx_text = header + "\n".join(lines[:40])  # keep prompt tidy
     return {"context_text": ctx_text, "as_of": now_iso}
 
 # --- Model call with robust fallbacks (no temperature) ---
@@ -235,7 +362,15 @@ def get_decision(snapshot: Dict[str, Any]) -> SimpleAdviceOut:
 # ---------- Routes ----------
 @app.get("/health")
 def health():
-    return {"ok": True, "model": MODEL, "ecb_rss": ECB_RSS, "fed_rss": FED_RSS}
+    return {
+        "ok": True,
+        "model": MODEL,
+        "ecb_rss": ECB_RSS,
+        "fed_rss": FED_RSS,
+        "eurostat_rss": EUROSTAT_RSS,
+        "bing_news_enabled": bool(BING_NEWS_KEY),
+        "marketaux_enabled": bool(MARKETAUX_KEY),
+    }
 
 # Primary endpoint (new minimal schema)
 @app.post("/advice")

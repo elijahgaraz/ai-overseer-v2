@@ -23,8 +23,12 @@ MARKETAUX_ENDPOINT = os.getenv("MARKETAUX_ENDPOINT", "https://api.marketaux.com/
 
 TIMEZONE = os.getenv("OVERSEER_TZ") or os.getenv("OVERSER_TZ") or "Europe/London"
 
+# New: tunables for “imminent” and HOLD→trade flip
+SOON_HOURS = float(os.getenv("SOON_HOURS", "3"))            # shrink from 12h to ~3h by default
+MIN_CONF_FOR_TRADE = float(os.getenv("MIN_CONF_FOR_TRADE", "65"))  # confidence threshold for flipping HOLD
+
 client = OpenAI(timeout=8.0)  # reads OPENAI_API_KEY
-app = FastAPI(title="AI Overseer (Direction + Confidence)", version="3.0.0")
+app = FastAPI(title="AI Overseer (Direction + Confidence)", version="3.1.0")
 
 # ---------- Models ----------
 class SimpleAdviceOut(BaseModel):
@@ -49,20 +53,20 @@ JSON_SCHEMA = {
   "strict": True
 }
 
+# Updated: relaxed guidance using SOON_HOURS
 SYSTEM = (
-    "You are the AI Overseer for an FX bot. You receive: "
-    "(1) a 'snapshot' with current market/indicator values and "
-    "(2) a 'context' summarizing reputable sources (ECB/Fed/Eurostat RSS + TradingEconomics calendar + optional headlines/sentiment). "
-    "Using ONLY this information, output direction and confidence percentage: "
-    "- direction ∈ {BUY, SELL, HOLD}\n"
-    "- confidence_pct: 0–100 (as a percentage, not probability)\n"
-    "Prefer HOLD near market-moving news (e.g., CPI/NFP/rate decisions) or elevated spreads. "
-    "If signals are mixed or context is stale, LOWER confidence. "
-    "If the calendar shows upcoming high-impact events within 72h, mention that explicitly. "
-    "If RSS feeds have no posts within the last 7 days, state 'no recent official posts' rather than implying staleness. "
-    "When high-impact events are more than 3 hours away and micro signals align, avoid excessive caution; select BUY/SELL with justified confidence. "
-    "If high-impact events are more than 12 hours away, do not prefer HOLD solely due to their presence. Prefer HOLD only if events are within 12 hours, spreads are elevated versus typical levels, or signals conflict. "
-    "Return JSON ONLY conforming to the provided schema."
+    f"You are the AI Overseer for an FX bot. You receive: "
+    f"(1) a 'snapshot' with current market/indicator values and "
+    f"(2) a 'context' summarizing reputable sources (ECB/Fed/Eurostat RSS + TradingEconomics calendar + optional headlines/sentiment). "
+    f"Using ONLY this information, output direction and confidence percentage:\n"
+    f"- direction ∈ {{BUY, SELL, HOLD}}\n"
+    f"- confidence_pct: 0–100 (as a percentage, not probability)\n"
+    f"Prefer HOLD only when market-moving news is imminent (within ~{SOON_HOURS} hours), spreads are elevated vs typical levels, OR signals conflict.\n"
+    f"If high-impact events are > {SOON_HOURS} hours away and micro signals align, do NOT be overly cautious: choose BUY/SELL with justified confidence.\n"
+    f"If the calendar shows upcoming high-impact events, mention timing explicitly.\n"
+    f"If RSS feeds have no posts within the last 7 days, state 'no recent official posts'.\n"
+    f"When events are between {SOON_HOURS} and 12 hours away, you may still trade if technicals are aligned; simply acknowledge the event.\n"
+    f"Return JSON ONLY conforming to the provided schema."
 )
 
 # ---------- Helpers ----------
@@ -314,7 +318,7 @@ def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     cal_items_all = fetch_te_calendar(countries)
     cal_items = filter_calendar_for_eurusd(cal_items_all)
     hrs_next = next_relevant_event_hours(cal_items)
-    soon_threshold = 12.0  # treat <12h as "imminent" risk
+    soon_threshold = SOON_HOURS  # configurable
 
     # Enrichers (optional)
     headlines = fetch_bing_headlines(sym or "EURUSD", count=8, freshness_hours=24)
@@ -326,7 +330,7 @@ def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     def bullets(label: str, items: List[Dict[str, Any]]) -> List[str]:
         if not items:
             if label in ("ecb", "fed", "eurostat"):
-                return [f"- {label.upper()}: No recent official posts (≤7d)."]
+                return [f"- {label.UPPER()}: No recent official posts (≤7d)."]
             elif label in ("headlines", "marketaux"):
                 return [f"- {label.upper()}: No recent items (provider disabled or no results)."]
             else:
@@ -358,7 +362,7 @@ def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     lines += bullets("marketaux", marketaux_items)
 
     ctx_text = header + "\n".join(lines[:40])  # keep prompt tidy
-    return {"context_text": ctx_text, "as_of": now_iso}
+    return {"context_text": ctx_text, "as_of": now_iso, "hrs_next": hrs_next}
 
 # --- Model call with robust fallbacks (no temperature) ---
 def model_decision_json(user_input: str) -> Dict[str, Any]:
@@ -394,6 +398,35 @@ def model_decision_json(user_input: str) -> Dict[str, Any]:
             )
             return json.loads(ch.choices[0].message.content)
 
+# --- Micro-bias inference to flip HOLD when safe ---
+def _infer_bias_from_snapshot(snap: Dict[str, Any]) -> Optional[str]:
+    """
+    Heuristic: use EMA fast vs slow; fallback to RSI bands.
+    Returns 'BUY' | 'SELL' | None
+    """
+    # case-insensitive access
+    s = {k.lower(): v for k, v in snap.items()}
+
+    # EMA bias
+    ef = s.get("ema_fast") or s.get("ema20") or s.get("ema_20") or s.get("ema_short") or s.get("ema10") or s.get("ema_10")
+    es = s.get("ema_slow") or s.get("ema50") or s.get("ema_50") or s.get("ema_long") or s.get("ema200") or s.get("ema_200")
+    if isinstance(ef, (int, float)) and isinstance(es, (int, float)):
+        if ef > es:
+            return "BUY"
+        elif ef < es:
+            return "SELL"
+
+    # RSI fallback
+    rsi = s.get("rsi") or s.get("rsi14") or s.get("rsi_14")
+    if isinstance(rsi, (int, float)):
+        if rsi >= 55:
+            return "BUY"
+        if rsi <= 45:
+            return "SELL"
+
+    # No clear bias
+    return None
+
 # Core decision helper
 def get_decision(snapshot: Dict[str, Any]) -> SimpleAdviceOut:
     ctx = build_context(snapshot)
@@ -403,6 +436,27 @@ def get_decision(snapshot: Dict[str, Any]) -> SimpleAdviceOut:
         "context": ctx["context_text"]
     }, separators=(",", ":"))
     data = model_decision_json(user_input)
+
+    # --- Post-LLM relaxation shim ---
+    try:
+        dir0 = (data.get("direction") or "HOLD").upper()
+        conf0 = float(data.get("confidence_pct") or 0.0)
+        hrs_next = ctx.get("hrs_next", float("inf"))
+
+        # If model is cautious but conditions are acceptable, flip to a trade
+        if dir0 == "HOLD" and conf0 >= MIN_CONF_FOR_TRADE and hrs_next >= SOON_HOURS:
+            bias = _infer_bias_from_snapshot(snapshot)
+            if bias in ("BUY", "SELL"):
+                data["direction"] = bias
+                note = f"Relaxed rule applied: next high-impact event in ~{round(hrs_next,1)}h (>= {SOON_HOURS}h) and confidence {conf0:.0f}%."
+                data["reason"] = (data.get("reason") or "").strip()
+                if data["reason"]:
+                    data["reason"] += " "
+                data["reason"] += note
+    except Exception:
+        # Don’t let the shim break main flow
+        pass
+
     return SimpleAdviceOut(**data)
 
 # ---------- Routes ----------
@@ -416,6 +470,8 @@ def health():
         "eurostat_rss": EUROSTAT_RSS,
         "bing_news_enabled": bool(BING_NEWS_KEY),
         "marketaux_enabled": bool(MARKETAUX_KEY),
+        "soon_hours": SOON_HOURS,
+        "min_conf_for_trade": MIN_CONF_FOR_TRADE,
     }
 
 # Primary endpoint (new minimal schema)

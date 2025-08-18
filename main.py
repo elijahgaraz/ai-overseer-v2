@@ -1,4 +1,4 @@
-import os, json, traceback
+import os, json, traceback, re
 from typing import Optional, Dict, Any, List
 from datetime import datetime, date, timezone, timedelta
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -23,12 +23,15 @@ MARKETAUX_ENDPOINT = os.getenv("MARKETAUX_ENDPOINT", "https://api.marketaux.com/
 
 TIMEZONE = os.getenv("OVERSEER_TZ") or os.getenv("OVERSER_TZ") or "Europe/London"
 
-# New: tunables for “imminent” and HOLD→trade flip
-SOON_HOURS = float(os.getenv("SOON_HOURS", "3"))            # shrink from 12h to ~3h by default
-MIN_CONF_FOR_TRADE = float(os.getenv("MIN_CONF_FOR_TRADE", "65"))  # confidence threshold for flipping HOLD
+# --- Tunables for caution window & relaxations ---
+SOON_HOURS = float(os.getenv("SOON_HOURS", "3"))                 # “imminent” window
+MIN_BLOCK_HOURS = float(os.getenv("MIN_BLOCK_HOURS", "1"))       # hard block inside this window
+MIN_CONF_FOR_TRADE = float(os.getenv("MIN_CONF_FOR_TRADE", "65"))# min conf to flip HOLD
+REQUIRE_EVENT_TIMING_MENTION = os.getenv("REQUIRE_EVENT_TIMING_MENTION", "0") in ("1","true","True")
+SUPPRESS_EVENT_TIMING_IN_REASON = os.getenv("SUPPRESS_EVENT_TIMING_IN_REASON", "1") in ("1","true","True")
 
 client = OpenAI(timeout=8.0)  # reads OPENAI_API_KEY
-app = FastAPI(title="AI Overseer (Direction + Confidence)", version="3.1.0")
+app = FastAPI(title="AI Overseer (Direction + Confidence)", version="3.2.0")
 
 # ---------- Models ----------
 class SimpleAdviceOut(BaseModel):
@@ -53,21 +56,22 @@ JSON_SCHEMA = {
   "strict": True
 }
 
-# Updated: relaxed guidance using SOON_HOURS
-SYSTEM = (
-    f"You are the AI Overseer for an FX bot. You receive: "
-    f"(1) a 'snapshot' with current market/indicator values and "
-    f"(2) a 'context' summarizing reputable sources (ECB/Fed/Eurostat RSS + TradingEconomics calendar + optional headlines/sentiment). "
-    f"Using ONLY this information, output direction and confidence percentage:\n"
-    f"- direction ∈ {{BUY, SELL, HOLD}}\n"
-    f"- confidence_pct: 0–100 (as a percentage, not probability)\n"
-    f"Prefer HOLD only when market-moving news is imminent (within ~{SOON_HOURS} hours), spreads are elevated vs typical levels, OR signals conflict.\n"
-    f"If high-impact events are > {SOON_HOURS} hours away and micro signals align, do NOT be overly cautious: choose BUY/SELL with justified confidence.\n"
-    f"If the calendar shows upcoming high-impact events, mention timing explicitly.\n"
-    f"If RSS feeds have no posts within the last 7 days, state 'no recent official posts'.\n"
-    f"When events are between {SOON_HOURS} and 12 hours away, you may still trade if technicals are aligned; simply acknowledge the event.\n"
-    f"Return JSON ONLY conforming to the provided schema."
-)
+# ---------- System prompt (conditional mention of event timing) ----------
+_prompt_bits = [
+    "You are the AI Overseer for an FX bot. You receive: "
+    "(1) a 'snapshot' with current market/indicator values and "
+    "(2) a 'context' summarizing reputable sources (ECB/Fed/Eurostat RSS + TradingEconomics calendar + optional headlines/sentiment). ",
+    "Using ONLY this information, output direction and confidence percentage:\n"
+    "- direction ∈ {BUY, SELL, HOLD}\n"
+    "- confidence_pct: 0–100 (as a percentage, not probability)\n",
+    f"Prefer HOLD only when market-moving news is imminent (within ~{SOON_HOURS} hours), spreads are elevated vs typical levels, OR signals conflict.\n",
+    f"If high-impact events are > {SOON_HOURS} hours away and micro signals align, do NOT be overly cautious: choose BUY/SELL with justified confidence.\n",
+    "If RSS feeds have no posts within the last 7 days, state 'no recent official posts'.\n",
+    f"When events are between {SOON_HOURS} and 12 hours away, you may still trade if technicals are aligned.\n",
+]
+if REQUIRE_EVENT_TIMING_MENTION:
+    _prompt_bits.append("If the calendar shows upcoming high-impact events, mention their timing explicitly.\n")
+SYSTEM = "".join(_prompt_bits) + "Return JSON ONLY conforming to the provided schema."
 
 # ---------- Helpers ----------
 def _auth_or_403(header_value: Optional[str]):
@@ -398,13 +402,12 @@ def model_decision_json(user_input: str) -> Dict[str, Any]:
             )
             return json.loads(ch.choices[0].message.content)
 
-# --- Micro-bias inference to flip HOLD when safe ---
+# --- Micro-bias & strength inference ---
 def _infer_bias_from_snapshot(snap: Dict[str, Any]) -> Optional[str]:
     """
     Heuristic: use EMA fast vs slow; fallback to RSI bands.
     Returns 'BUY' | 'SELL' | None
     """
-    # case-insensitive access
     s = {k.lower(): v for k, v in snap.items()}
 
     # EMA bias
@@ -424,8 +427,34 @@ def _infer_bias_from_snapshot(snap: Dict[str, Any]) -> Optional[str]:
         if rsi <= 45:
             return "SELL"
 
-    # No clear bias
     return None
+
+def _strong_alignment(snap: Dict[str, Any]) -> bool:
+    """
+    Optional strength check used to allow trades even when an event is soon (but not imminent).
+    """
+    s = {k.lower(): v for k, v in snap.items()}
+    # EMA + RSI + ADX combo
+    bias = _infer_bias_from_snapshot(snap)
+    rsi = s.get("rsi") or s.get("rsi14") or s.get("rsi_14")
+    adx = s.get("adx") or s.get("adx14") or s.get("adx_14")
+    score = 0
+    if bias in ("BUY","SELL"): score += 1
+    if isinstance(rsi, (int,float)) and (rsi >= 58 or rsi <= 42): score += 1
+    if isinstance(adx, (int,float)) and adx >= 18: score += 1
+    return score >= 2
+
+# --- Reason sanitizer (optional) ---
+_REASON_TIME_RE = re.compile(r"(?i)\b(within|in)\s+(the\s+)?next?\s+\d+(\.\d+)?\s*hours?\b[^.]*\.?")
+def _sanitize_reason(text: str) -> str:
+    if not text:
+        return text
+    if SUPPRESS_EVENT_TIMING_IN_REASON:
+        text = __REASON_TIME_RE.sub("", text).strip()
+        # Clean up double spaces and trailing commas
+        text = re.sub(r"\s{2,}", " ", text)
+        text = re.sub(r"\s+,", ",", text)
+    return text
 
 # Core decision helper
 def get_decision(snapshot: Dict[str, Any]) -> SimpleAdviceOut:
@@ -443,16 +472,23 @@ def get_decision(snapshot: Dict[str, Any]) -> SimpleAdviceOut:
         conf0 = float(data.get("confidence_pct") or 0.0)
         hrs_next = ctx.get("hrs_next", float("inf"))
 
-        # If model is cautious but conditions are acceptable, flip to a trade
-        if dir0 == "HOLD" and conf0 >= MIN_CONF_FOR_TRADE and hrs_next >= SOON_HOURS:
-            bias = _infer_bias_from_snapshot(snapshot)
-            if bias in ("BUY", "SELL"):
-                data["direction"] = bias
-                note = f"Relaxed rule applied: next high-impact event in ~{round(hrs_next,1)}h (>= {SOON_HOURS}h) and confidence {conf0:.0f}%."
-                data["reason"] = (data.get("reason") or "").strip()
-                if data["reason"]:
-                    data["reason"] += " "
-                data["reason"] += note
+        # Hard block only if event is very close
+        if hrs_next <= MIN_BLOCK_HOURS:
+            data["direction"] = "HOLD"
+        else:
+            # If model said HOLD but confidence decent and event not imminent, or technicals are strong, flip
+            can_flip_window = (hrs_next >= SOON_HOURS) or ((MIN_BLOCK_HOURS < hrs_next < SOON_HOURS) and _strong_alignment(snapshot))
+            if dir0 == "HOLD" and conf0 >= MIN_CONF_FOR_TRADE and can_flip_window:
+                bias = _infer_bias_from_snapshot(snapshot)
+                if bias in ("BUY", "SELL"):
+                    data["direction"] = bias
+                    note = f"Relaxed rule: next event ~{round(hrs_next,1)}h; conf {conf0:.0f}%."
+                    reason = (data.get("reason") or "").strip()
+                    data["reason"] = (reason + (" " if reason else "") + note).strip()
+
+        # Optionally remove “in the next X hours” phrasing from the reason
+        data["reason"] = _sanitize_reason(data.get("reason") or "")
+
     except Exception:
         # Don’t let the shim break main flow
         pass
@@ -471,7 +507,10 @@ def health():
         "bing_news_enabled": bool(BING_NEWS_KEY),
         "marketaux_enabled": bool(MARKETAUX_KEY),
         "soon_hours": SOON_HOURS,
+        "min_block_hours": MIN_BLOCK_HOURS,
         "min_conf_for_trade": MIN_CONF_FOR_TRADE,
+        "require_event_timing_mention": REQUIRE_EVENT_TIMING_MENTION,
+        "suppress_event_timing_in_reason": SUPPRESS_EVENT_TIMING_IN_REASON,
     }
 
 # Primary endpoint (new minimal schema)

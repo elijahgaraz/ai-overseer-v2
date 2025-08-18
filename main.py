@@ -24,14 +24,19 @@ MARKETAUX_ENDPOINT = os.getenv("MARKETAUX_ENDPOINT", "https://api.marketaux.com/
 TIMEZONE = os.getenv("OVERSEER_TZ") or os.getenv("OVERSER_TZ") or "Europe/London"
 
 # --- Tunables for caution window & relaxations ---
-SOON_HOURS = float(os.getenv("SOON_HOURS", "3"))                 # “imminent” window
-MIN_BLOCK_HOURS = float(os.getenv("MIN_BLOCK_HOURS", "1"))       # hard block inside this window
-MIN_CONF_FOR_TRADE = float(os.getenv("MIN_CONF_FOR_TRADE", "65"))# min conf to flip HOLD
-REQUIRE_EVENT_TIMING_MENTION = os.getenv("REQUIRE_EVENT_TIMING_MENTION", "0") in ("1","true","True")
-SUPPRESS_EVENT_TIMING_IN_REASON = os.getenv("SUPPRESS_EVENT_TIMING_IN_REASON", "1") in ("1","true","True")
+SOON_HOURS = float(os.getenv("SOON_HOURS", "3"))                     # “imminent” window for caution
+MIN_BLOCK_HOURS = float(os.getenv("MIN_BLOCK_HOURS", "1"))           # hard block inside this window
+MIN_CONF_FOR_TRADE = float(os.getenv("MIN_CONF_FOR_TRADE", "65"))    # min confidence to flip HOLD
+
+REQUIRE_EVENT_TIMING_MENTION = os.getenv("REQUIRE_EVENT_TIMING_MENTION", "0") in ("1", "true", "True")
+SUPPRESS_EVENT_TIMING_IN_REASON = os.getenv("SUPPRESS_EVENT_TIMING_IN_REASON", "1") in ("1", "true", "True")
+
+SHOW_NEXT_EVENT_IN_CONTEXT = os.getenv("SHOW_NEXT_EVENT_IN_CONTEXT", "0") in ("1", "true", "True")
+GRACE_MINUTES = float(os.getenv("GRACE_MINUTES", "10"))              # ±minutes treated as non-blocking
+ALLOW_TRADE_DURING_EVENT = os.getenv("ALLOW_TRADE_DURING_EVENT", "0") in ("1", "true", "True")
 
 client = OpenAI(timeout=8.0)  # reads OPENAI_API_KEY
-app = FastAPI(title="AI Overseer (Direction + Confidence)", version="3.2.0")
+app = FastAPI(title="AI Overseer (Direction + Confidence)", version="3.3.0")
 
 # ---------- Models ----------
 class SimpleAdviceOut(BaseModel):
@@ -41,19 +46,19 @@ class SimpleAdviceOut(BaseModel):
     as_of: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 JSON_SCHEMA = {
-  "name": "EntryAdvice",
-  "schema": {
-    "type": "object",
-    "properties": {
-      "direction": {"type":"string","enum":["BUY","SELL","HOLD"]},
-      "confidence_pct": {"type":"number","minimum":0,"maximum":100},
-      "reason": {"type":"string"},
-      "as_of": {"type":"string"}
+    "name": "EntryAdvice",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "direction": {"type": "string", "enum": ["BUY", "SELL", "HOLD"]},
+            "confidence_pct": {"type": "number", "minimum": 0, "maximum": 100},
+            "reason": {"type": "string"},
+            "as_of": {"type": "string"}
+        },
+        "required": ["direction", "confidence_pct", "reason", "as_of"],
+        "additionalProperties": False
     },
-    "required": ["direction","confidence_pct","reason","as_of"],
-    "additionalProperties": False
-  },
-  "strict": True
+    "strict": True
 }
 
 # ---------- System prompt (conditional mention of event timing) ----------
@@ -282,7 +287,12 @@ def _hours_until(dt_iso: str) -> float:
         if not dt:
             return float("inf")
         now = datetime.now(timezone.utc)
-        return max(0.0, (dt - now).total_seconds() / 3600.0)
+        delta_hours = (dt - now).total_seconds() / 3600.0
+        # Treat events within ±GRACE_MINUTES as non-blocking; also ignore past events
+        grace_h = GRACE_MINUTES / 60.0
+        if abs(delta_hours) <= grace_h or delta_hours < 0:
+            return float("inf")
+        return delta_hours
     except Exception:
         return float("inf")
 
@@ -353,9 +363,12 @@ def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         f"LATEST CONTEXT as of {now_iso} (tz=UTC; local_tz={TIMEZONE}):\n"
         "• RSS recency: ≤7 days; Economic calendar window: today + next 3 days; importance=high\n"
         f"• Countries for calendar: {', '.join(countries)}\n"
-        f"• Next relevant high-impact event in ≈ {next_evt_str}h (imminent<{soon_threshold}h) {filtered_note}\n"
-        f"• Optional enrichers enabled: {enabled_str}\n"
     )
+    if SHOW_NEXT_EVENT_IN_CONTEXT:
+        header += (
+            f"• Next relevant high-impact event in ≈ {next_evt_str}h (imminent<{soon_threshold}h) {filtered_note}\n"
+        )
+    header += f"• Optional enrichers enabled: {enabled_str}\n"
 
     lines: List[str] = []
     lines += bullets("ecb", ecb_items)
@@ -434,14 +447,16 @@ def _strong_alignment(snap: Dict[str, Any]) -> bool:
     Optional strength check used to allow trades even when an event is soon (but not imminent).
     """
     s = {k.lower(): v for k, v in snap.items()}
-    # EMA + RSI + ADX combo
     bias = _infer_bias_from_snapshot(snap)
     rsi = s.get("rsi") or s.get("rsi14") or s.get("rsi_14")
     adx = s.get("adx") or s.get("adx14") or s.get("adx_14")
     score = 0
-    if bias in ("BUY","SELL"): score += 1
-    if isinstance(rsi, (int,float)) and (rsi >= 58 or rsi <= 42): score += 1
-    if isinstance(adx, (int,float)) and adx >= 18: score += 1
+    if bias in ("BUY", "SELL"):
+        score += 1
+    if isinstance(rsi, (int, float)) and (rsi >= 58 or rsi <= 42):
+        score += 1
+    if isinstance(adx, (int, float)) and adx >= 18:
+        score += 1
     return score >= 2
 
 # --- Reason sanitizer (optional) ---
@@ -450,8 +465,7 @@ def _sanitize_reason(text: str) -> str:
     if not text:
         return text
     if SUPPRESS_EVENT_TIMING_IN_REASON:
-        text = __REASON_TIME_RE.sub("", text).strip()
-        # Clean up double spaces and trailing commas
+        text = _REASON_TIME_RE.sub("", text).strip()
         text = re.sub(r"\s{2,}", " ", text)
         text = re.sub(r"\s+,", ",", text)
     return text
@@ -472,21 +486,30 @@ def get_decision(snapshot: Dict[str, Any]) -> SimpleAdviceOut:
         conf0 = float(data.get("confidence_pct") or 0.0)
         hrs_next = ctx.get("hrs_next", float("inf"))
 
-        # Hard block only if event is very close
-        if hrs_next <= MIN_BLOCK_HOURS:
-            data["direction"] = "HOLD"
-        else:
-            # If model said HOLD but confidence decent and event not imminent, or technicals are strong, flip
-            can_flip_window = (hrs_next >= SOON_HOURS) or ((MIN_BLOCK_HOURS < hrs_next < SOON_HOURS) and _strong_alignment(snapshot))
-            if dir0 == "HOLD" and conf0 >= MIN_CONF_FOR_TRADE and can_flip_window:
-                bias = _infer_bias_from_snapshot(snapshot)
-                if bias in ("BUY", "SELL"):
-                    data["direction"] = bias
-                    note = f"Relaxed rule: next event ~{round(hrs_next,1)}h; conf {conf0:.0f}%."
-                    reason = (data.get("reason") or "").strip()
-                    data["reason"] = (reason + (" " if reason else "") + note).strip()
+        # Decide if we can flip HOLD to a trade
+        can_flip = False
 
-        # Optionally remove “in the next X hours” phrasing from the reason
+        # Case A: event not imminent
+        if hrs_next >= SOON_HOURS:
+            can_flip = True
+
+        # Case B: event soon but not hard-blocked AND strong alignment
+        elif MIN_BLOCK_HOURS < hrs_next < SOON_HOURS and _strong_alignment(snapshot):
+            can_flip = True
+
+        # Case C: event is 'now' (or within MIN_BLOCK_HOURS) but you explicitly allow trading during events
+        elif hrs_next <= MIN_BLOCK_HOURS and ALLOW_TRADE_DURING_EVENT and _strong_alignment(snapshot):
+            can_flip = True
+
+        if dir0 == "HOLD" and conf0 >= MIN_CONF_FOR_TRADE and can_flip:
+            bias = _infer_bias_from_snapshot(snapshot)
+            if bias in ("BUY", "SELL"):
+                data["direction"] = bias
+                note = f"Relaxed rule applied (hrs_next≈{ '∞' if hrs_next==float('inf') else round(hrs_next,1) }, conf {conf0:.0f}%)."
+                reason = (data.get("reason") or "").strip()
+                data["reason"] = (reason + (" " if reason else "") + note).strip()
+
+        # Finally sanitize any timing mentions from the reason (belt-and-braces)
         data["reason"] = _sanitize_reason(data.get("reason") or "")
 
     except Exception:
@@ -511,6 +534,9 @@ def health():
         "min_conf_for_trade": MIN_CONF_FOR_TRADE,
         "require_event_timing_mention": REQUIRE_EVENT_TIMING_MENTION,
         "suppress_event_timing_in_reason": SUPPRESS_EVENT_TIMING_IN_REASON,
+        "show_next_event_in_context": SHOW_NEXT_EVENT_IN_CONTEXT,
+        "grace_minutes": GRACE_MINUTES,
+        "allow_trade_during_event": ALLOW_TRADE_DURING_EVENT,
     }
 
 # Primary endpoint (new minimal schema)

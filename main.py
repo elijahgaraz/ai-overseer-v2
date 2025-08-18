@@ -330,7 +330,7 @@ def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     def bullets(label: str, items: List[Dict[str, Any]]) -> List[str]:
         if not items:
             if label in ("ecb", "fed", "eurostat"):
-                return [f"- {label.UPPER()}: No recent official posts (≤7d)."]
+                return [f"- {label.upper()}: No recent official posts (≤7d)."]
             elif label in ("headlines", "marketaux"):
                 return [f"- {label.upper()}: No recent items (provider disabled or no results)."]
             else:

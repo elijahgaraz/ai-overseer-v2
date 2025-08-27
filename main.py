@@ -36,7 +36,7 @@ GRACE_MINUTES = float(os.getenv("GRACE_MINUTES", "10"))              # ±minutes
 ALLOW_TRADE_DURING_EVENT = os.getenv("ALLOW_TRADE_DURING_EVENT", "0") in ("1", "true", "True")
 
 client = OpenAI(timeout=8.0)  # reads OPENAI_API_KEY
-app = FastAPI(title="AI Overseer (Direction + Confidence)", version="3.3.1")
+app = FastAPI(title="AI Overseer (Direction + Confidence)", version="3.3.2")
 
 # ---------- Models ----------
 class SimpleAdviceOut(BaseModel):
@@ -342,14 +342,21 @@ def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     now_iso = _iso(now_utc)
 
     def bullets(label: str, items: List[Dict[str, Any]]) -> List[str]:
+        lab = str(label).upper()
         if not items:
             if label in ("ecb", "fed", "eurostat"):
-                return [f"- {label.UPPER() if hasattr(label,'upper') else str(label).upper()}: No recent official posts (≤7d)."]
+                return [f"- {lab}: No recent official posts (≤7d)."]
             elif label in ("headlines", "marketaux"):
-                return [f"- {label.UPPER() if hasattr(label,'upper') else str(label).upper()}: No recent items (provider disabled or no results)."]
+                return [f"- {lab}: No recent items (provider disabled or no results)."]
             else:
-                return [f"- {label.UPPER() if hasattr(label,'upper') else str(label).upper()}: No high-impact items in the window."]
-        return [f"- {label.UPPER() if hasattr(label,'upper') else str(label).upper()}: {it['title']} [{it.get('published')}] -> {it['url']}" for it in items]
+                return [f"- {lab}: No high-impact items in the window."]
+        out = []
+        for it in items:
+            title = it.get("title", "item")
+            pub = it.get("published")
+            url = it.get("url", "")
+            out.append(f"- {lab}: {title} [{pub}] -> {url}")
+        return out
 
     enabled_bits = []
     if BING_NEWS_KEY: enabled_bits.append("BingNews")
@@ -561,7 +568,7 @@ def get_decision(snapshot: Dict[str, Any]) -> SimpleAdviceOut:
                 data["direction"] = bias
                 note = f"Relaxed rule applied (hrs_next≈{ '∞' if hrs_next==float('inf') else round(hrs_next,1) }, conf {conf0:.0f}%)."
                 reason = (data.get("reason") or "").strip()
-                data["reason"] = (reason + (" " if reason else "") + note).strip()
+                data["reason"] = (reason + (' ' if reason else '') + note).strip()
 
         # Finally sanitize any timing mentions from the reason (belt-and-braces)
         data["reason"] = _sanitize_reason(data.get("reason") or "")

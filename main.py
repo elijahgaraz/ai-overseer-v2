@@ -36,7 +36,7 @@ GRACE_MINUTES = float(os.getenv("GRACE_MINUTES", "10"))              # ±minutes
 ALLOW_TRADE_DURING_EVENT = os.getenv("ALLOW_TRADE_DURING_EVENT", "0") in ("1", "true", "True")
 
 client = OpenAI(timeout=8.0)  # reads OPENAI_API_KEY
-app = FastAPI(title="AI Overseer (Direction + Confidence)", version="3.3.0")
+app = FastAPI(title="AI Overseer (Direction + Confidence)", version="3.3.1")
 
 # ---------- Models ----------
 class SimpleAdviceOut(BaseModel):
@@ -342,14 +342,15 @@ def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     now_iso = _iso(now_utc)
 
     def bullets(label: str, items: List[Dict[str, Any]]) -> List[str]:
+        lab = str(label).upper()
         if not items:
             if label in ("ecb", "fed", "eurostat"):
-                return [f"- {label.upper()}: No recent official posts (≤7d)."]
+                return [f"- {lab}: No recent official posts (≤7d)."]
             elif label in ("headlines", "marketaux"):
-                return [f"- {label.upper()}: No recent items (provider disabled or no results)."]
+                return [f"- {lab}: No recent items (provider disabled or no results)."]
             else:
-                return [f"- {label.upper()}: No high-impact items in the window."]
-        return [f"- {label.upper()}: {it['title']} [{it.get('published')}] -> {it['url']}" for it in items]
+                return [f"- {lab}: No high-impact items in the window."]
+        return [f"- {lab}: {it.get('title','item')} [{it.get('published')}] -> {it.get('url','')}" for it in items]
 
     enabled_bits = []
     if BING_NEWS_KEY: enabled_bits.append("BingNews")
@@ -366,7 +367,8 @@ def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     )
     if SHOW_NEXT_EVENT_IN_CONTEXT:
         header += (
-            f"• Next relevant high-impact event in ≈ {next_evt_str}h (imminent<{soon_threshold}h) {filtered_note}\
+            f"• Next relevant high-impact event in ≈ {next_evt_str}h (imminent<{soon_threshold}h) {filtered_note}\n"
+        )
     header += f"• Optional enrichers enabled: {enabled_str}\n"
 
     lines: List[str] = []
@@ -379,7 +381,6 @@ def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
 
     ctx_text = header + "\n".join(lines[:40])  # keep prompt tidy
     return {"context_text": ctx_text, "as_of": now_iso, "hrs_next": hrs_next}
-
 
 # --- Model call with robust fallbacks (no temperature) ---
 def model_decision_json(user_input: str) -> Dict[str, Any]:
@@ -406,7 +407,7 @@ def model_decision_json(user_input: str) -> Dict[str, Any]:
             return json.loads(ch.choices[0].message.content)
         except Exception:
             # Final fallback: instruct JSON-only
-            ch = client.chat_completions.create(  # backward-compat if needed
+            ch = client.chat.completions.create(  # patched to modern SDK path
                 model=MODEL,
                 messages=[
                     {"role": "system", "content": SYSTEM + "\nReturn JSON ONLY with keys: direction, confidence_pct, reason, as_of."},
@@ -414,7 +415,6 @@ def model_decision_json(user_input: str) -> Dict[str, Any]:
                 ],
             )
             return json.loads(ch.choices[0].message.content)
-
 
 # --- Micro-bias & strength inference ---
 def _infer_bias_from_snapshot(snap: Dict[str, Any]) -> Optional[str]:
@@ -460,7 +460,6 @@ def _strong_alignment(snap: Dict[str, Any]) -> bool:
         score += 1
     return score >= 2
 
-
 # --- Reason sanitizer (optional) ---
 _REASON_TIME_RE = re.compile(r"(?i)\b(within|in)\s+(the\s+)?next?\s+\d+(\.\d+)?\s*hours?\b[^.]*\.?")
 def _sanitize_reason(text: str) -> str:
@@ -471,7 +470,6 @@ def _sanitize_reason(text: str) -> str:
         text = re.sub(r"\s{2,}", " ", text)
         text = re.sub(r"\s+,", ",", text)
     return text
-
 
 # Core decision helper
 def get_decision(snapshot: Dict[str, Any]) -> SimpleAdviceOut:
@@ -520,7 +518,6 @@ def get_decision(snapshot: Dict[str, Any]) -> SimpleAdviceOut:
         pass
 
     return SimpleAdviceOut(**data)
-
 
 # ---------- Routes ----------
 @app.get("/health")

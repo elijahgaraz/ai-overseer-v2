@@ -1,14 +1,15 @@
 import os, json, traceback, re, time, random
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from datetime import datetime, date, timezone, timedelta
-from fastapi import FastAPI, Header, HTTPException, Request
+
+from fastapi import FastAPI, Header, HTTPException, Request, Query
 from pydantic import BaseModel, Field
 import httpx, feedparser
 from openai import OpenAI
 from email.utils import parsedate_to_datetime
 
 # ---------- Config ----------
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")  # gpt-5, gpt-5-mini, or gpt-4o-mini are fine
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")  # e.g. gpt-5, gpt-5-mini, gpt-4o-mini
 ADVISOR_TOKEN = os.getenv("ADVISOR_TOKEN", "")
 TE_API_KEY = os.getenv("TE_API_KEY", "guest:guest")
 ECB_RSS = os.getenv("ECB_RSS", "https://www.ecb.europa.eu/press/rss/press.html")
@@ -35,8 +36,11 @@ SHOW_NEXT_EVENT_IN_CONTEXT = os.getenv("SHOW_NEXT_EVENT_IN_CONTEXT", "0") in ("1
 GRACE_MINUTES = float(os.getenv("GRACE_MINUTES", "10"))              # ±minutes treated as non-blocking
 ALLOW_TRADE_DURING_EVENT = os.getenv("ALLOW_TRADE_DURING_EVENT", "0") in ("1", "true", "True")
 
+CONTEXT_MAX_CHARS = int(os.getenv("CONTEXT_MAX_CHARS", "5000"))      # bound prompt context size
+
 client = OpenAI(timeout=8.0)  # reads OPENAI_API_KEY
-app = FastAPI(title="AI Overseer (Direction + Confidence)", version="3.3.2")
+app = FastAPI(title="AI Overseer (Direction + Confidence)", version="3.3.3")
+
 
 # ---------- Models ----------
 class SimpleAdviceOut(BaseModel):
@@ -44,6 +48,7 @@ class SimpleAdviceOut(BaseModel):
     confidence_pct: float = Field(0.0, ge=0.0, le=100.0)
     reason: Optional[str] = ""
     as_of: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
 
 JSON_SCHEMA = {
     "name": "EntryAdvice",
@@ -61,6 +66,19 @@ JSON_SCHEMA = {
     "strict": True
 }
 
+
+# ---------- Lifecycle hooks (future-proofing) ----------
+@app.on_event("startup")
+async def on_startup():
+    # place to initialize async clients in the future if needed
+    pass
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    # close any persistent clients here if you add them later
+    pass
+
+
 # ---------- System prompt (conditional mention of event timing) ----------
 _prompt_bits = [
     "You are the AI Overseer for an FX bot. You receive: "
@@ -77,6 +95,7 @@ _prompt_bits = [
 if REQUIRE_EVENT_TIMING_MENTION:
     _prompt_bits.append("If the calendar shows upcoming high-impact events, mention their timing explicitly.\n")
 SYSTEM = "".join(_prompt_bits) + "Return JSON ONLY conforming to the provided schema."
+
 
 # ---------- Helpers ----------
 def _auth_or_403(header_value: Optional[str]):
@@ -106,6 +125,7 @@ def _safe_parse_dt(s: Optional[str]) -> Optional[datetime]:
         except Exception:
             return None
 
+
 def fetch_te_calendar(countries: List[str]) -> List[Dict[str, Any]]:
     """
     High-impact economic calendar for today + next 3 days.
@@ -122,9 +142,13 @@ def fetch_te_calendar(countries: List[str]) -> List[Dict[str, Any]]:
             r = http.get(url)
             if r.status_code != 200:
                 return []
-            data = r.json()
-            out = []
+            data: Union[List[Dict[str, Any]], Dict[str, Any]] = r.json()
+            if not isinstance(data, list):
+                return []
+            out: List[Dict[str, Any]] = []
             for it in data[:50]:
+                if not isinstance(it, dict):
+                    continue
                 title = it.get("Event") or it.get("Title") or "Event"
                 when = it.get("DateTime") or it.get("DateUtc") or it.get("Date")
                 country = it.get("Country") or ""
@@ -135,6 +159,7 @@ def fetch_te_calendar(countries: List[str]) -> List[Dict[str, Any]]:
             return out
     except Exception:
         return []
+
 
 def fetch_rss(url: str, limit: int = 5, max_age_days: int = 7) -> List[Dict[str, Any]]:
     """
@@ -158,6 +183,7 @@ def fetch_rss(url: str, limit: int = 5, max_age_days: int = 7) -> List[Dict[str,
         pass
     return out
 
+
 def _countries_for_symbol(sym: str) -> List[str]:
     """
     Choose relevant countries for TE calendar based on the pair symbol.
@@ -168,6 +194,7 @@ def _countries_for_symbol(sym: str) -> List[str]:
         return ["Euro Area", "United States"]
     # sensible default
     return ["Euro Area", "United States"]
+
 
 # ---------- Enrichers ----------
 def fetch_eurostat_recent(limit: int = 5, max_age_days: int = 7) -> List[Dict[str, Any]]:
@@ -218,7 +245,7 @@ def fetch_bing_headlines(symbol: str, count: int = 8, freshness_hours: int = 24)
                         "published": pub_dt.isoformat()
                     })
         # De-dup by title/url and keep most recent
-        dedup = {}
+        dedup: Dict[tuple, Dict[str, Any]] = {}
         for it in sorted(results, key=lambda x: x["published"], reverse=True):
             key = (it["title"], it["url"])
             if key not in dedup:
@@ -226,6 +253,7 @@ def fetch_bing_headlines(symbol: str, count: int = 8, freshness_hours: int = 24)
         return list(dedup.values())[:count]
     except Exception:
         return []
+
 
 def fetch_marketaux_sentiment(symbol: str, limit: int = 6, max_age_hours: int = 48) -> List[Dict[str, Any]]:
     """
@@ -273,6 +301,7 @@ def fetch_marketaux_sentiment(symbol: str, limit: int = 6, max_age_hours: int = 
     except Exception:
         return []
 
+
 # ---------- EURUSD relevance helpers ----------
 KEYWORDS_EURUSD = (
     "ecb", "deposit facility", "refi", "rate decision",
@@ -311,12 +340,13 @@ def next_relevant_event_hours(cal_items: List[Dict[str, Any]]) -> float:
     return best
 
 def filter_calendar_for_eurusd(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out = []
+    out: List[Dict[str, Any]] = []
     for it in items:
         t = (it.get("title") or "").lower()
         if any(k in t for k in KEYWORDS_EURUSD):
             out.append(it)
     return out
+
 
 # ---------- Context builder ----------
 def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -350,7 +380,7 @@ def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
                 return [f"- {lab}: No recent items (provider disabled or no results)."]
             else:
                 return [f"- {lab}: No high-impact items in the window."]
-        out = []
+        out: List[str] = []
         for it in items:
             title = it.get("title", "item")
             pub = it.get("published")
@@ -358,7 +388,7 @@ def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
             out.append(f"- {lab}: {title} [{pub}] -> {url}")
         return out
 
-    enabled_bits = []
+    enabled_bits: List[str] = []
     if BING_NEWS_KEY: enabled_bits.append("BingNews")
     if MARKETAUX_KEY: enabled_bits.append("Marketaux")
     enabled_str = ", ".join(enabled_bits) if enabled_bits else "none"
@@ -385,8 +415,12 @@ def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     lines += bullets("headlines", headlines)
     lines += bullets("marketaux", marketaux_items)
 
-    ctx_text = header + "\n".join(lines[:40])  # keep prompt tidy
+    ctx_text = header + "\n".join(lines[:40])  # cap number of bullet lines
+    if len(ctx_text) > CONTEXT_MAX_CHARS:
+        ctx_text = ctx_text[:CONTEXT_MAX_CHARS] + "\n…(truncated)"
+
     return {"context_text": ctx_text, "as_of": now_iso, "hrs_next": hrs_next}
+
 
 # --- OpenAI call with retry/backoff & graceful fallback ---
 def _chat_complete_with_retry(model: str, messages: List[Dict[str, str]], **kwargs) -> Dict[str, Any]:
@@ -406,7 +440,7 @@ def _chat_complete_with_retry(model: str, messages: List[Dict[str, str]], **kwar
             if hasattr(ch, "to_dict"):
                 return ch.to_dict()
             # Generic fallback
-            return json.loads(ch.json()) if hasattr(ch, "json") else ch
+            return json.loads(ch.json()) if hasattr(ch, "json") else ch  # type: ignore
         except Exception as e:
             msg = str(e).lower()
             quota = ("insufficient_quota" in msg) or ("you exceeded your current quota" in msg)
@@ -418,6 +452,7 @@ def _chat_complete_with_retry(model: str, messages: List[Dict[str, str]], **kwar
                 raise
             delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
             time.sleep(delay)
+
 
 def model_decision_json(user_input: str) -> Dict[str, Any]:
     messages = [
@@ -476,6 +511,7 @@ def model_decision_json(user_input: str) -> Dict[str, Any]:
             "as_of": now_iso,
         }
 
+
 # --- Micro-bias & strength inference ---
 def _infer_bias_from_snapshot(snap: Dict[str, Any]) -> Optional[str]:
     """
@@ -503,6 +539,7 @@ def _infer_bias_from_snapshot(snap: Dict[str, Any]) -> Optional[str]:
 
     return None
 
+
 def _strong_alignment(snap: Dict[str, Any]) -> bool:
     """
     Optional strength check used to allow trades even when an event is soon (but not imminent).
@@ -520,6 +557,7 @@ def _strong_alignment(snap: Dict[str, Any]) -> bool:
         score += 1
     return score >= 2
 
+
 # --- Reason sanitizer (optional) ---
 _REASON_TIME_RE = re.compile(r"(?i)\b(within|in)\s+(the\s+)?next?\s+\d+(\.\d+)?\s*hours?\b[^.]*\.?")
 def _sanitize_reason(text: str) -> str:
@@ -530,6 +568,7 @@ def _sanitize_reason(text: str) -> str:
         text = re.sub(r"\s{2,}", " ", text)
         text = re.sub(r"\s+,", ",", text)
     return text
+
 
 # Core decision helper
 def get_decision(snapshot: Dict[str, Any]) -> SimpleAdviceOut:
@@ -579,6 +618,7 @@ def get_decision(snapshot: Dict[str, Any]) -> SimpleAdviceOut:
 
     return SimpleAdviceOut(**data)
 
+
 # ---------- Routes ----------
 @app.get("/health")
 def health():
@@ -598,7 +638,41 @@ def health():
         "show_next_event_in_context": SHOW_NEXT_EVENT_IN_CONTEXT,
         "grace_minutes": GRACE_MINUTES,
         "allow_trade_during_event": ALLOW_TRADE_DURING_EVENT,
+        "context_max_chars": CONTEXT_MAX_CHARS,
+        "version": "3.3.3",
     }
+
+
+@app.get("/health/llm")
+def health_llm(probe: int = Query(0, description="Set to 1 to run a tiny LLM probe")):
+    """
+    Lightweight status endpoint. No OpenAI call unless you hit /health/llm?probe=1
+    """
+    status = "idle"
+    detail = ""
+    if probe == 1:
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": "Return JSON with keys ok, as_of. Nothing else."},
+                    {"role": "user", "content": "Respond with {\"ok\": true, \"as_of\": ISO8601 now} only."},
+                ],
+                response_format={"type": "json_object"},
+            )
+            _ = json.loads(resp.choices[0].message.content)
+            status = "ok"
+        except Exception as e:
+            msg = str(e).lower()
+            if "insufficient_quota" in msg or "exceeded your current quota" in msg:
+                status = "quota_exhausted"
+            elif "rate limit" in msg or "429" in msg:
+                status = "rate_limited"
+            else:
+                status = "error"
+            detail = str(e)
+    return {"llm_status": status, "detail": detail, "model": MODEL}
+
 
 # Primary endpoint (new minimal schema)
 @app.post("/advice")
@@ -618,6 +692,7 @@ async def advice(request: Request, x_advisor_token: Optional[str] = Header(None)
         print("ADVICE ERROR:", repr(e))
         traceback.print_exc()
         raise HTTPException(500, f"advisor_error:{e.__class__.__name__}")
+
 
 # Compatibility endpoint for older bots (maps to long/short/skip + 0..1 confidence)
 @app.post("/gbpusd-advice")

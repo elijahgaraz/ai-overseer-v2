@@ -25,26 +25,28 @@ MARKETAUX_ENDPOINT = os.getenv("MARKETAUX_ENDPOINT", "https://api.marketaux.com/
 TIMEZONE = os.getenv("OVERSEER_TZ") or os.getenv("OVERSER_TZ") or "Europe/London"
 
 # --- Timeboxing & safety switches ---
-REQUEST_DEADLINE_SEC = float(os.getenv("REQUEST_DEADLINE_SEC", "8.0"))  # hard budget for /advice
-MIN_BUDGET_WARN_SEC = 2.0   # if below this, skip optional work
+# Your bot times out at 7.0s → keep our total under ~5.5s by default.
+REQUEST_DEADLINE_SEC = float(os.getenv("REQUEST_DEADLINE_SEC", "5.5"))
+MIN_BUDGET_WARN_SEC = 1.2   # if below this, skip optional work and LLM
 SAFE_MODE = os.getenv("SAFE_MODE", "0") in ("1", "true", "True")  # disable enrichers
 
 # --- Tunables for caution window & relaxations ---
-SOON_HOURS = float(os.getenv("SOON_HOURS", "3"))                  # “imminent” window for caution
-MIN_BLOCK_HOURS = float(os.getenv("MIN_BLOCK_HOURS", "1"))        # hard block inside this window
-MIN_CONF_FOR_TRADE = float(os.getenv("MIN_CONF_FOR_TRADE", "65")) # min confidence to flip HOLD
+SOON_HOURS = float(os.getenv("SOON_HOURS", "3"))
+MIN_BLOCK_HOURS = float(os.getenv("MIN_BLOCK_HOURS", "1"))
+MIN_CONF_FOR_TRADE = float(os.getenv("MIN_CONF_FOR_TRADE", "65"))
 
 REQUIRE_EVENT_TIMING_MENTION = os.getenv("REQUIRE_EVENT_TIMING_MENTION", "0") in ("1", "true", "True")
 SUPPRESS_EVENT_TIMING_IN_REASON = os.getenv("SUPPRESS_EVENT_TIMING_IN_REASON", "1") in ("1", "true", "True")
 
 SHOW_NEXT_EVENT_IN_CONTEXT = os.getenv("SHOW_NEXT_EVENT_IN_CONTEXT", "0") in ("1", "true", "True")
-GRACE_MINUTES = float(os.getenv("GRACE_MINUTES", "10"))           # ±minutes treated as non-blocking
+GRACE_MINUTES = float(os.getenv("GRACE_MINUTES", "10"))
 ALLOW_TRADE_DURING_EVENT = os.getenv("ALLOW_TRADE_DURING_EVENT", "0") in ("1", "true", "True")
 
-CONTEXT_MAX_CHARS = int(os.getenv("CONTEXT_MAX_CHARS", "5000"))   # bound prompt context size
+CONTEXT_MAX_CHARS = int(os.getenv("CONTEXT_MAX_CHARS", "4800"))   # bound prompt context size
 
-client = OpenAI(timeout=8.0)  # OpenAI call timeout per request
-app = FastAPI(title="AI Overseer (Direction + Confidence)", version="3.4.0")
+# Make OpenAI calls fast: 4s per request max (retries included under our 5.5s budget)
+client = OpenAI(timeout=4.0)
+app = FastAPI(title="AI Overseer (Direction + Confidence)", version="3.4.1")
 
 
 # ---------- Models ----------
@@ -135,11 +137,8 @@ def _time_left(start: float) -> float:
     return REQUEST_DEADLINE_SEC - (time.monotonic() - start)
 
 
-# ---------- External fetchers (timeboxed) ----------
+# ---------- External fetchers (tight timeouts) ----------
 def fetch_te_calendar(countries: List[str], start: float) -> List[Dict[str, Any]]:
-    """
-    High-impact economic calendar for today + next 3 days.
-    """
     if _time_left(start) < MIN_BUDGET_WARN_SEC:
         return []
     d1 = date.today().isoformat()
@@ -150,7 +149,7 @@ def fetch_te_calendar(countries: List[str], start: float) -> List[Dict[str, Any]
         f"country={country_param}&importance=3&d1={d1}&d2={d2}&format=json&c={TE_API_KEY}"
     )
     try:
-        with httpx.Client(timeout=5.0) as http:
+        with httpx.Client(timeout=3.5) as http:
             r = http.get(url)
             if r.status_code != 200:
                 return []
@@ -158,7 +157,7 @@ def fetch_te_calendar(countries: List[str], start: float) -> List[Dict[str, Any]
             if not isinstance(data, list):
                 return []
             out: List[Dict[str, Any]] = []
-            for it in data[:50]:
+            for it in data[:40]:
                 if not isinstance(it, dict):
                     continue
                 title = it.get("Event") or it.get("Title") or "Event"
@@ -172,10 +171,7 @@ def fetch_te_calendar(countries: List[str], start: float) -> List[Dict[str, Any]
     except Exception:
         return []
 
-def fetch_rss(url: str, start: float, limit: int = 5, max_age_days: int = 7) -> List[Dict[str, Any]]:
-    """
-    RSS fetch with recency filter (≤ max_age_days). Skips unknown/naive timestamps.
-    """
+def fetch_rss(url: str, start: float, limit: int = 4, max_age_days: int = 7) -> List[Dict[str, Any]]:
     if _time_left(start) < MIN_BUDGET_WARN_SEC:
         return []
     out: List[Dict[str, Any]] = []
@@ -202,35 +198,26 @@ def _countries_for_symbol(sym: str) -> List[str]:
         return ["Euro Area", "United States"]
     return ["Euro Area", "United States"]
 
-def fetch_eurostat_recent(start: float, limit: int = 5, max_age_days: int = 7) -> List[Dict[str, Any]]:
+def fetch_eurostat_recent(start: float, limit: int = 4, max_age_days: int = 7) -> List[Dict[str, Any]]:
     return fetch_rss(EUROSTAT_RSS, start, limit=limit, max_age_days=max_age_days)
 
-def fetch_bing_headlines(symbol: str, start: float, count: int = 8, freshness_hours: int = 24) -> List[Dict[str, Any]]:
+def fetch_bing_headlines(symbol: str, start: float, count: int = 6, freshness_hours: int = 24) -> List[Dict[str, Any]]:
     if SAFE_MODE or not BING_NEWS_KEY or _time_left(start) < MIN_BUDGET_WARN_SEC:
         return []
     queries = [
         "EURUSD OR \"EUR/USD\"",
         "ECB OR \"European Central Bank\"",
         "\"Federal Reserve\" OR Fed",
-        "Euro area inflation OR Eurozone CPI",
-        "US CPI OR Nonfarm payrolls OR FOMC",
     ]
     headers = {"Ocp-Apim-Subscription-Key": BING_NEWS_KEY}
     freshness = "Day" if freshness_hours <= 24 else "Week"
     results: List[Dict[str, Any]] = []
     try:
-        with httpx.Client(timeout=4.5, headers=headers) as http:
+        with httpx.Client(timeout=3.5, headers=headers) as http:
             for q in queries:
                 if _time_left(start) < MIN_BUDGET_WARN_SEC:
                     break
-                params = {
-                    "q": q,
-                    "count": max(2, count // len(queries)),
-                    "freshness": freshness,
-                    "sortBy": "Date",
-                    "safeSearch": "Off",
-                    "textDecorations": "false",
-                }
+                params = {"q": q, "count": max(1, count // len(queries)), "freshness": freshness, "sortBy": "Date"}
                 r = http.get(BING_NEWS_ENDPOINT, params=params)
                 if r.status_code != 200:
                     continue
@@ -238,15 +225,10 @@ def fetch_bing_headlines(symbol: str, start: float, count: int = 8, freshness_ho
                 for art in (data.get("value") or []):
                     title = art.get("name") or "headline"
                     url = art.get("url") or ""
-                    published = art.get("datePublished") or ""
-                    pub_dt = _safe_parse_dt(published)
+                    pub_dt = _safe_parse_dt(art.get("datePublished"))
                     if not pub_dt:
                         continue
-                    results.append({
-                        "title": title,
-                        "url": url,
-                        "published": pub_dt.isoformat()
-                    })
+                    results.append({"title": title, "url": url, "published": pub_dt.isoformat()})
         # De-dup by title/url and keep most recent
         dedup: Dict[tuple, Dict[str, Any]] = {}
         for it in sorted(results, key=lambda x: x["published"], reverse=True):
@@ -257,20 +239,14 @@ def fetch_bing_headlines(symbol: str, start: float, count: int = 8, freshness_ho
     except Exception:
         return []
 
-def fetch_marketaux_sentiment(symbol: str, start: float, limit: int = 6, max_age_hours: int = 48) -> List[Dict[str, Any]]:
+def fetch_marketaux_sentiment(symbol: str, start: float, limit: int = 4, max_age_hours: int = 48) -> List[Dict[str, Any]]:
     if SAFE_MODE or not MARKETAUX_KEY or _time_left(start) < MIN_BUDGET_WARN_SEC:
         return []
     q = "EURUSD OR \"EUR/USD\" OR ECB OR \"Euro area\" OR Eurozone OR FOMC OR \"Federal Reserve\""
-    params = {
-        "api_token": MARKETAUX_KEY,
-        "search": q,
-        "language": "en",
-        "sort": "published_at:desc",
-        "limit": str(limit),
-    }
+    params = {"api_token": MARKETAUX_KEY, "search": q, "language": "en", "sort": "published_at:desc", "limit": str(limit)}
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
     try:
-        with httpx.Client(timeout=4.5) as http:
+        with httpx.Client(timeout=3.5) as http:
             r = http.get(MARKETAUX_ENDPOINT, params=params)
             if r.status_code != 200:
                 return []
@@ -279,21 +255,17 @@ def fetch_marketaux_sentiment(symbol: str, start: float, limit: int = 6, max_age
             for art in (data.get("data") or [])[:limit]:
                 title = art.get("title") or "news"
                 url = art.get("url") or ""
-                published = art.get("published_at")
-                pub_dt = _safe_parse_dt(published)
+                pub_dt = _safe_parse_dt(art.get("published_at"))
                 if not pub_dt or pub_dt < cutoff:
                     continue
                 sentiment = None
                 if isinstance(art.get("entities"), list):
                     for ent in art["entities"]:
                         if isinstance(ent, dict) and "sentiment_score" in ent:
-                            sentiment = ent.get("sentiment_score")
-                            break
+                            sentiment = ent.get("sentiment_score"); break
                 if sentiment is None:
                     sentiment = art.get("sentiment") or art.get("overall_sentiment_score")
-                t = f"{title}"
-                if sentiment is not None:
-                    t += f" (sentiment={sentiment})"
+                t = f"{title}" + (f" (sentiment={sentiment})" if sentiment is not None else "")
                 out.append({"title": t, "url": url, "published": pub_dt.isoformat()})
             return out
     except Exception:
@@ -348,9 +320,9 @@ def build_context(snapshot: Dict[str, Any], start: float) -> Dict[str, Any]:
     countries = _countries_for_symbol(sym)
 
     # Official & baseline (prioritize)
-    ecb_items = fetch_rss(ECB_RSS, start, 5, max_age_days=7)
-    fed_items = fetch_rss(FED_RSS, start, 5, max_age_days=7)
-    eurostat_items = fetch_eurostat_recent(start, 5, max_age_days=7)
+    ecb_items = fetch_rss(ECB_RSS, start, 4, max_age_days=7)
+    fed_items = fetch_rss(FED_RSS, start, 4, max_age_days=7)
+    eurostat_items = fetch_eurostat_recent(start, 4, max_age_days=7)
 
     # Calendar
     cal_items_all = fetch_te_calendar(countries, start)
@@ -359,8 +331,8 @@ def build_context(snapshot: Dict[str, Any], start: float) -> Dict[str, Any]:
     soon_threshold = SOON_HOURS
 
     # Optional enrichers (skip if low budget or SAFE_MODE)
-    headlines = fetch_bing_headlines(sym or "EURUSD", start, count=8, freshness_hours=24)
-    marketaux_items = fetch_marketaux_sentiment(sym or "EURUSD", start, limit=6, max_age_hours=48)
+    headlines = fetch_bing_headlines(sym or "EURUSD", start, count=6, freshness_hours=24)
+    marketaux_items = fetch_marketaux_sentiment(sym or "EURUSD", start, limit=4, max_age_hours=48)
 
     now_utc = datetime.now(timezone.utc)
     now_iso = _iso(now_utc)
@@ -396,9 +368,7 @@ def build_context(snapshot: Dict[str, Any], start: float) -> Dict[str, Any]:
         f"• Countries for calendar: {', '.join(countries)}\n"
     )
     if SHOW_NEXT_EVENT_IN_CONTEXT:
-        header += (
-            f"• Next relevant high-impact event in ≈ {next_evt_str}h (imminent<{soon_threshold}h) {filtered_note}\n"
-        )
+        header += f"• Next relevant high-impact event in ≈ {next_evt_str}h (imminent<{soon_threshold}h) {filtered_note}\n"
     header += f"• Optional enrichers enabled: {enabled_str}\n"
 
     lines: List[str] = []
@@ -409,7 +379,7 @@ def build_context(snapshot: Dict[str, Any], start: float) -> Dict[str, Any]:
     lines += bullets("headlines", headlines)
     lines += bullets("marketaux", marketaux_items)
 
-    ctx_text = header + "\n".join(lines[:40])
+    ctx_text = header + "\n".join(lines[:32])
     if len(ctx_text) > CONTEXT_MAX_CHARS:
         ctx_text = ctx_text[:CONTEXT_MAX_CHARS] + "\n…(truncated)"
 
@@ -419,11 +389,11 @@ def build_context(snapshot: Dict[str, Any], start: float) -> Dict[str, Any]:
 # --- OpenAI call with retry/backoff & graceful fallback ---
 def _chat_complete_with_retry(model: str, messages: List[Dict[str, str]], **kwargs) -> Dict[str, Any]:
     """
-    Retries on transient 429/5xx up to 3 times with exponential backoff + jitter.
-    Returns a plain dict.
+    Retries on transient 429/5xx up to 2 times (short) with exponential backoff + jitter.
+    Fits under ~4s OpenAI timeout and ~5.5s overall request deadline.
     """
-    max_attempts = 3
-    base_delay = 0.7
+    max_attempts = 2
+    base_delay = 0.5
     for attempt in range(1, max_attempts + 1):
         try:
             ch = client.chat.completions.create(model=model, messages=messages, **kwargs)
@@ -435,12 +405,12 @@ def _chat_complete_with_retry(model: str, messages: List[Dict[str, str]], **kwar
         except Exception as e:
             msg = str(e).lower()
             quota = ("insufficient_quota" in msg) or ("you exceeded your current quota" in msg)
-            transient = any(k in msg for k in ("rate limit", "429", "timeout", "temporarily unavailable", "gateway", "5xx", "service unavailable"))
+            transient = any(k in msg for k in ("rate limit", "429", "timeout", "temporarily unavailable", "gateway", "5", "unavailable"))
             if quota:
                 raise
             if attempt == max_attempts or not transient:
                 raise
-            delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+            delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.2)
             time.sleep(delay)
 
 
@@ -493,29 +463,21 @@ def model_decision_json(user_input: str) -> Dict[str, Any]:
             reason = "LLM unavailable (insufficient quota)"
         elif "rate limit" in emsg.lower():
             reason = "LLM unavailable (rate limited)"
-        return {
-            "direction": "HOLD",
-            "confidence_pct": 0.0,
-            "reason": reason,
-            "as_of": now_iso,
-        }
+        return {"direction": "HOLD", "confidence_pct": 0.0, "reason": reason, "as_of": now_iso}
 
 
 # --- Micro-bias & strength inference ---
 def _infer_bias_from_snapshot(snap: Dict[str, Any]) -> Optional[str]:
     s = {k.lower(): v for k, v in snap.items()}
-
     ef = s.get("ema_fast") or s.get("ema20") or s.get("ema_20") or s.get("ema_short") or s.get("ema10") or s.get("ema_10")
     es = s.get("ema_slow") or s.get("ema50") or s.get("ema_50") or s.get("ema_long") or s.get("ema200") or s.get("ema_200")
     if isinstance(ef, (int, float)) and isinstance(es, (int, float)):
         if ef > es: return "BUY"
         if ef < es: return "SELL"
-
     rsi = s.get("rsi") or s.get("rsi14") or s.get("rsi_14")
     if isinstance(rsi, (int, float)):
         if rsi >= 55: return "BUY"
         if rsi <= 45: return "SELL"
-
     return None
 
 def _strong_alignment(snap: Dict[str, Any]) -> bool:
@@ -552,20 +514,11 @@ def get_decision(snapshot: Dict[str, Any], start: float) -> SimpleAdviceOut:
 
     # If time remaining is tiny, short-circuit LLM and return a heuristic HOLD
     if _time_left(start) < MIN_BUDGET_WARN_SEC:
-        return SimpleAdviceOut(
-            direction="HOLD",
-            confidence_pct=0.0,
-            reason="Time budget too low; returned safe HOLD",
-            as_of=ctx["as_of"],
-        )
+        return SimpleAdviceOut(direction="HOLD", confidence_pct=0.0, reason="Time budget low; safe HOLD", as_of=ctx["as_of"])
 
-    user_input = json.dumps({
-        "as_of": ctx["as_of"],
-        "snapshot": snapshot,
-        "context": ctx["context_text"]
-    }, separators=(",", ":"))
+    user_input = json.dumps({"as_of": ctx["as_of"], "snapshot": snapshot, "context": ctx["context_text"]}, separators=(",", ":"))
 
-    # If we are still OK on time, call the LLM (which itself has retry & small timeout)
+    # If still OK on time, call the LLM (retry is short & bounded)
     data = model_decision_json(user_input)
 
     # --- Post-LLM relaxation shim ---
@@ -591,7 +544,6 @@ def get_decision(snapshot: Dict[str, Any], start: float) -> SimpleAdviceOut:
                 data["reason"] = (reason + (' ' if reason else '') + note).strip()
 
         data["reason"] = _sanitize_reason(data.get("reason") or "")
-
     except Exception:
         pass
 
@@ -620,13 +572,12 @@ def health():
         "context_max_chars": CONTEXT_MAX_CHARS,
         "request_deadline_sec": REQUEST_DEADLINE_SEC,
         "safe_mode": SAFE_MODE,
-        "version": "3.4.0",
+        "version": "3.4.1",
     }
 
 @app.get("/health/llm")
 def health_llm(probe: int = Query(0, description="Set to 1 to run a tiny LLM probe")):
-    status = "idle"
-    detail = ""
+    status = "idle"; detail = ""
     if probe == 1:
         try:
             resp = client.chat.completions.create(
@@ -663,7 +614,6 @@ async def advice(request: Request, x_advisor_token: Optional[str] = Header(None)
     if not isinstance(snapshot, dict):
         raise HTTPException(400, "Body must be a JSON object or {'snapshot': {...}}")
 
-    # Hard stop if budget already blown
     if _time_left(start) <= 0:
         return SimpleAdviceOut(direction="HOLD", confidence_pct=0.0, reason="Timeout at request entry").model_dump()
 
@@ -673,7 +623,6 @@ async def advice(request: Request, x_advisor_token: Optional[str] = Header(None)
     except Exception as e:
         print("ADVICE ERROR:", repr(e))
         traceback.print_exc()
-        # Return HOLD instead of 500 to avoid worker timeouts/kill loops
         now_iso = datetime.now(timezone.utc).isoformat()
         return SimpleAdviceOut(direction="HOLD", confidence_pct=0.0, reason=f"advisor_error:{e.__class__.__name__}", as_of=now_iso).model_dump()
 
@@ -697,20 +646,8 @@ async def gbpusd_advice(request: Request, x_advisor_token: Optional[str] = Heade
         out = get_decision(snapshot, start)
         d = (out.direction or "HOLD").upper()
         mapped = "long" if d == "BUY" else ("short" if d == "SELL" else "skip")
-        return {
-            "action": mapped,
-            "confidence": round((out.confidence_pct or 0.0) / 100.0, 4),
-            "sl_pips": 0,
-            "tp_pips": 0,
-            "reason": out.reason or ""
-        }
+        return {"action": mapped, "confidence": round((out.confidence_pct or 0.0) / 100.0, 4), "sl_pips": 0, "tp_pips": 0, "reason": out.reason or ""}
     except Exception as e:
         print("GBPUSD-ADVICE ERROR:", repr(e))
         traceback.print_exc()
-        return {
-            "action": "skip",
-            "confidence": 0.0,
-            "sl_pips": 0,
-            "tp_pips": 0,
-            "reason": "advisor_error"
-        }
+        return {"action": "skip", "confidence": 0.0, "sl_pips": 0, "tp_pips": 0, "reason": "advisor_error"}

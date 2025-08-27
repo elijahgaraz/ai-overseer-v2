@@ -1,4 +1,4 @@
-import os, json, traceback, re
+import os, json, traceback, re, time, random
 from typing import Optional, Dict, Any, List
 from datetime import datetime, date, timezone, timedelta
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -36,7 +36,7 @@ GRACE_MINUTES = float(os.getenv("GRACE_MINUTES", "10"))              # ±minutes
 ALLOW_TRADE_DURING_EVENT = os.getenv("ALLOW_TRADE_DURING_EVENT", "0") in ("1", "true", "True")
 
 client = OpenAI(timeout=8.0)  # reads OPENAI_API_KEY
-app = FastAPI(title="AI Overseer (Direction + Confidence)", version="3.3.0")
+app = FastAPI(title="AI Overseer (Direction + Confidence)", version="3.3.1")
 
 # ---------- Models ----------
 class SimpleAdviceOut(BaseModel):
@@ -344,12 +344,12 @@ def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     def bullets(label: str, items: List[Dict[str, Any]]) -> List[str]:
         if not items:
             if label in ("ecb", "fed", "eurostat"):
-                return [f"- {label.upper()}: No recent official posts (≤7d)."]
+                return [f"- {label.UPPER() if hasattr(label,'upper') else str(label).upper()}: No recent official posts (≤7d)."]
             elif label in ("headlines", "marketaux"):
-                return [f"- {label.upper()}: No recent items (provider disabled or no results)."]
+                return [f"- {label.UPPER() if hasattr(label,'upper') else str(label).upper()}: No recent items (provider disabled or no results)."]
             else:
-                return [f"- {label.upper()}: No high-impact items in the window."]
-        return [f"- {label.upper()}: {it['title']} [{it.get('published')}] -> {it['url']}" for it in items]
+                return [f"- {label.UPPER() if hasattr(label,'upper') else str(label).upper()}: No high-impact items in the window."]
+        return [f"- {label.UPPER() if hasattr(label,'upper') else str(label).upper()}: {it['title']} [{it.get('published')}] -> {it['url']}" for it in items]
 
     enabled_bits = []
     if BING_NEWS_KEY: enabled_bits.append("BingNews")
@@ -381,39 +381,93 @@ def build_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     ctx_text = header + "\n".join(lines[:40])  # keep prompt tidy
     return {"context_text": ctx_text, "as_of": now_iso, "hrs_next": hrs_next}
 
-# --- Model call with robust fallbacks (no temperature) ---
+# --- OpenAI call with retry/backoff & graceful fallback ---
+def _chat_complete_with_retry(model: str, messages: List[Dict[str, str]], **kwargs) -> Dict[str, Any]:
+    """
+    Minimal retry helper for transient OpenAI errors.
+    Retries on 429/5xx up to 3 times with exponential backoff + jitter.
+    Returns a plain dict for consistent downstream handling.
+    """
+    max_attempts = 3
+    base_delay = 0.8
+    for attempt in range(1, max_attempts + 1):
+        try:
+            ch = client.chat.completions.create(model=model, messages=messages, **kwargs)
+            # Return as dict for uniform access
+            if hasattr(ch, "model_dump"):
+                return ch.model_dump()
+            if hasattr(ch, "to_dict"):
+                return ch.to_dict()
+            # Generic fallback
+            return json.loads(ch.json()) if hasattr(ch, "json") else ch
+        except Exception as e:
+            msg = str(e).lower()
+            quota = ("insufficient_quota" in msg) or ("you exceeded your current quota" in msg)
+            transient = any(k in msg for k in ("rate limit", "429", "timeout", "temporarily unavailable", "gateway", "5xx", "service unavailable"))
+            if quota:
+                # Hard fail for real quota exhaustion — caller will gracefully HOLD.
+                raise
+            if attempt == max_attempts or not transient:
+                raise
+            delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+            time.sleep(delay)
+
 def model_decision_json(user_input: str) -> Dict[str, Any]:
     messages = [
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": user_input},
     ]
-    # Try JSON Schema first
+
+    # 1) Try strict JSON Schema
     try:
-        ch = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
+        resp = _chat_complete_with_retry(
+            MODEL,
+            messages,
             response_format={"type": "json_schema", "json_schema": JSON_SCHEMA},
         )
-        return json.loads(ch.choices[0].message.content)
+        content = resp["choices"][0]["message"]["content"]
+        return json.loads(content)
     except Exception:
-        # Fallback: JSON object mode
-        try:
-            ch = client.chat.completions.create(
-                model=MODEL,
-                messages=messages,
-                response_format={"type": "json_object"},
-            )
-            return json.loads(ch.choices[0].message.content)
-        except Exception:
-            # Final fallback: instruct JSON-only
-            ch = client.chat_completions.create(  # backward-compat if needed
-                model=MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM + "\nReturn JSON ONLY with keys: direction, confidence_pct, reason, as_of."},
-                    {"role": "user", "content": user_input},
-                ],
-            )
-            return json.loads(ch.choices[0].message.content)
+        pass
+
+    # 2) Fallback: structured JSON object
+    try:
+        resp = _chat_complete_with_retry(
+            MODEL,
+            messages,
+            response_format={"type": "json_object"},
+        )
+        content = resp["choices"][0]["message"]["content"]
+        return json.loads(content)
+    except Exception:
+        pass
+
+    # 3) Final fallback: instruct "JSON ONLY" — still via the new SDK path
+    try:
+        resp = _chat_complete_with_retry(
+            MODEL,
+            [
+                {"role": "system", "content": SYSTEM + "\nReturn JSON ONLY with keys: direction, confidence_pct, reason, as_of."},
+                {"role": "user", "content": user_input},
+            ],
+        )
+        content = resp["choices"][0]["message"]["content"]
+        return json.loads(content)
+    except Exception as e:
+        # Graceful degrade for hard failures (e.g., insufficient_quota / persistent 429)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        reason = "LLM unavailable"
+        emsg = str(e)
+        if "insufficient_quota" in emsg or "exceeded your current quota" in emsg:
+            reason = "LLM unavailable (insufficient quota)"
+        elif "rate limit" in emsg.lower():
+            reason = "LLM unavailable (rate limited)"
+        return {
+            "direction": "HOLD",
+            "confidence_pct": 0.0,
+            "reason": reason,
+            "as_of": now_iso,
+        }
 
 # --- Micro-bias & strength inference ---
 def _infer_bias_from_snapshot(snap: Dict[str, Any]) -> Optional[str]:

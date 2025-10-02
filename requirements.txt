@@ -1,18 +1,22 @@
 # AI Overseer Market Analyzer Requirements
-# For deployment on Render
+# Compatible with Python 3.11 for Render deployment
 
-# Core dependencies
-Flask==2.3.3
+# Core dependencies with fixed versions for compatibility
+Flask==3.0.0
 flask-cors==4.0.0
-openai==0.28.1
+werkzeug==3.0.0
+
+# OpenAI - using newer version that's compatible
+openai==1.6.1
+
+# Essential packages
 numpy==1.24.3
+requests==2.31.0
 python-dotenv==1.0.0
 
-# Additional utilities
-requests==2.31.0
-gunicorn==21.2.0  # For production deployment on Render
+# Production server
+gunicorn==21.2.0
 
-# Optional for enhanced functionality
-pandas==2.0.3  # If you want to add more complex data analysis
-redis==4.6.0  # If you want to add persistent caching
-APScheduler==3.10.4  # If you want scheduled tasks
+# JSON handling (built-in, but ensuring compatibility)
+setuptools==69.0.2
+wheel==0.42.0

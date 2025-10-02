@@ -1,7 +1,18 @@
-# requirements.txt
-fastapi
-gunicorn
-uvicorn
-openai
-httpx
-feedparser
+# AI Overseer Market Analyzer Requirements
+# For deployment on Render
+
+# Core dependencies
+Flask==2.3.3
+flask-cors==4.0.0
+openai==0.28.1
+numpy==1.24.3
+python-dotenv==1.0.0
+
+# Additional utilities
+requests==2.31.0
+gunicorn==21.2.0  # For production deployment on Render
+
+# Optional for enhanced functionality
+pandas==2.0.3  # If you want to add more complex data analysis
+redis==4.6.0  # If you want to add persistent caching
+APScheduler==3.10.4  # If you want scheduled tasks
